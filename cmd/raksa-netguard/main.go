@@ -20,7 +20,7 @@ import (
 )
 
 var (
-	version   = "0.1.0"
+	version   = "0.2.0"
 	commit    = "dev"
 	buildDate = "unknown"
 )
@@ -183,14 +183,7 @@ func runAnalyze(args []string, stdout, stderr io.Writer) int {
 	logFmt := fs.String("log-format", "auto", "Input log format: auto, ufw, iptables, jsonl")
 	outFmt := fs.String("format", "table", "Output format: table, json, sarif")
 	failOnRaw := fs.String("fail-on", "", "Exit with code 2 if any finding meets severity (critical, high, medium, low, info)")
-
-	defaults := detector.DefaultConfig()
-	window := fs.Duration("window", defaults.Window, "Sliding detection window duration")
-	vertThresh := fs.Int("vertical-threshold", defaults.VerticalPortThreshold, "Unique destination ports per target host to trigger NET-101")
-	horizThresh := fs.Int("horizontal-threshold", defaults.HorizontalHostThreshold, "Unique destination hosts per port to trigger NET-102")
-	burstThresh := fs.Int("burst-threshold", defaults.BurstThreshold, "Connection attempts per source within window to trigger NET-103")
-	cooldown := fs.Duration("cooldown", defaults.Cooldown, "Cooldown duration per source and rule")
-	ignorePrivate := fs.Bool("ignore-private", defaults.IgnorePrivate, "Ignore RFC1918 private and loopback source IPs")
+	df := registerDetectorFlags(fs)
 
 	if err := fs.Parse(args); err != nil {
 		return exitErr
@@ -201,6 +194,12 @@ func runAnalyze(args []string, stdout, stderr io.Writer) int {
 	}
 
 	failOn, err := parseOptionalSeverity(*failOnRaw)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "error: %v\n", err)
+		return exitErr
+	}
+
+	detCfg, err := df.resolve(fs)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "error: %v\n", err)
 		return exitErr
@@ -219,15 +218,7 @@ func runAnalyze(args []string, stdout, stderr io.Writer) int {
 		reader = f
 	}
 
-	det := detector.New(detector.Config{
-		Window:                  *window,
-		VerticalPortThreshold:   *vertThresh,
-		HorizontalHostThreshold: *horizThresh,
-		BurstThreshold:          *burstThresh,
-		Cooldown:                *cooldown,
-		IgnorePrivate:           *ignorePrivate,
-	})
-
+	det := detector.New(detCfg)
 	findings, stats, err := det.AnalyzeReader(reader, *logFmt)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "error analyzing logs: %v\n", err)
@@ -257,14 +248,7 @@ func runWatch(args []string, stdout, stderr io.Writer) int {
 	logPath := fs.String("log", "", "Path to firewall/flow log file to tail (required)")
 	logFmt := fs.String("log-format", "auto", "Input log format: auto, ufw, iptables, jsonl")
 	poll := fs.Duration("poll", 500*time.Millisecond, "Log polling interval")
-
-	defaults := detector.DefaultConfig()
-	window := fs.Duration("window", defaults.Window, "Sliding detection window duration")
-	vertThresh := fs.Int("vertical-threshold", defaults.VerticalPortThreshold, "Unique destination ports per target host to trigger NET-101")
-	horizThresh := fs.Int("horizontal-threshold", defaults.HorizontalHostThreshold, "Unique destination hosts per port to trigger NET-102")
-	burstThresh := fs.Int("burst-threshold", defaults.BurstThreshold, "Connection attempts per source within window to trigger NET-103")
-	cooldown := fs.Duration("cooldown", defaults.Cooldown, "Cooldown duration per source and rule")
-	ignorePrivate := fs.Bool("ignore-private", defaults.IgnorePrivate, "Ignore RFC1918 private and loopback source IPs")
+	df := registerDetectorFlags(fs)
 
 	webhookURL := fs.String("webhook", os.Getenv("RAKSA_WEBHOOK_URL"), "Optional webhook URL for real-time alert delivery (or set RAKSA_WEBHOOK_URL)")
 	webhookFmt := fs.String("webhook-format", "generic", "Webhook payload format: generic, slack, discord")
@@ -278,9 +262,14 @@ func runWatch(args []string, stdout, stderr io.Writer) int {
 		return exitErr
 	}
 
+	detCfg, err := df.resolve(fs)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "error: %v\n", err)
+		return exitErr
+	}
+
 	var sink *notifier.WebhookSink
 	if strings.TrimSpace(*webhookURL) != "" {
-		var err error
 		sink, err = notifier.NewWebhookSink(notifier.WebhookConfig{
 			URL:         *webhookURL,
 			Format:      *webhookFmt,
@@ -292,21 +281,14 @@ func runWatch(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
-	det := detector.New(detector.Config{
-		Window:                  *window,
-		VerticalPortThreshold:   *vertThresh,
-		HorizontalHostThreshold: *horizThresh,
-		BurstThreshold:          *burstThresh,
-		Cooldown:                *cooldown,
-		IgnorePrivate:           *ignorePrivate,
-	})
+	det := detector.New(detCfg)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	_, _ = fmt.Fprintf(stderr, "Watching %s (format=%s, window=%s)... press Ctrl+C to stop.\n", *logPath, *logFmt, window.String())
+	_, _ = fmt.Fprintf(stderr, "Watching %s (format=%s, window=%s)... press Ctrl+C to stop.\n", *logPath, *logFmt, detCfg.Window.String())
 
-	err := detector.WatchFile(ctx, *logPath, *logFmt, det, *poll, func(f schema.Finding) {
+	err = detector.WatchFile(ctx, *logPath, *logFmt, det, *poll, func(f schema.Finding) {
 		raw, marshalErr := json.Marshal(f)
 		if marshalErr == nil {
 			_, _ = fmt.Fprintln(stdout, string(raw))
@@ -322,6 +304,110 @@ func runWatch(args []string, stdout, stderr io.Writer) int {
 		return exitErr
 	}
 	return exitOK
+}
+
+type detectorFlags struct {
+	policyPath    *string
+	window        *time.Duration
+	vertThresh    *int
+	horizThresh   *int
+	burstThresh   *int
+	distSources   *int
+	distPorts     *int
+	cooldown      *time.Duration
+	ignorePrivate *bool
+}
+
+func registerDetectorFlags(fs *flag.FlagSet) *detectorFlags {
+	defaults := detector.DefaultConfig()
+	return &detectorFlags{
+		policyPath:    fs.String("policy", "", "Optional YAML policy file supplying detector threshold defaults"),
+		window:        fs.Duration("window", defaults.Window, "Sliding detection window duration"),
+		vertThresh:    fs.Int("vertical-threshold", defaults.VerticalPortThreshold, "Unique destination ports per target host to trigger NET-101"),
+		horizThresh:   fs.Int("horizontal-threshold", defaults.HorizontalHostThreshold, "Unique destination hosts per port to trigger NET-102"),
+		burstThresh:   fs.Int("burst-threshold", defaults.BurstThreshold, "Connection attempts per source within window to trigger NET-103"),
+		distSources:   fs.Int("distributed-sources", defaults.DistributedSourceThreshold, "Distinct source IPs targeting one host to trigger NET-104"),
+		distPorts:     fs.Int("distributed-ports", defaults.DistributedPortThreshold, "Distinct destination ports hit on one host to trigger NET-104"),
+		cooldown:      fs.Duration("cooldown", defaults.Cooldown, "Cooldown duration per source/target and rule"),
+		ignorePrivate: fs.Bool("ignore-private", defaults.IgnorePrivate, "Ignore RFC1918 private and loopback source IPs"),
+	}
+}
+
+func (df *detectorFlags) resolve(fs *flag.FlagSet) (detector.Config, error) {
+	cfg := detector.DefaultConfig()
+
+	if strings.TrimSpace(*df.policyPath) != "" {
+		policy, err := baseline.LoadPolicy(*df.policyPath)
+		if err != nil {
+			return cfg, err
+		}
+		if dp := policy.Detector; dp != nil {
+			if strings.TrimSpace(dp.Window) != "" {
+				d, err := time.ParseDuration(dp.Window)
+				if err != nil {
+					return cfg, fmt.Errorf("invalid detector.window %q in policy: %w", dp.Window, err)
+				}
+				cfg.Window = d
+			}
+			if dp.VerticalPortThreshold > 0 {
+				cfg.VerticalPortThreshold = dp.VerticalPortThreshold
+			}
+			if dp.HorizontalHostThreshold > 0 {
+				cfg.HorizontalHostThreshold = dp.HorizontalHostThreshold
+			}
+			if dp.BurstThreshold > 0 {
+				cfg.BurstThreshold = dp.BurstThreshold
+			}
+			if dp.DistributedSourceThreshold > 0 {
+				cfg.DistributedSourceThreshold = dp.DistributedSourceThreshold
+			}
+			if dp.DistributedPortThreshold > 0 {
+				cfg.DistributedPortThreshold = dp.DistributedPortThreshold
+			}
+			if strings.TrimSpace(dp.Cooldown) != "" {
+				d, err := time.ParseDuration(dp.Cooldown)
+				if err != nil {
+					return cfg, fmt.Errorf("invalid detector.cooldown %q in policy: %w", dp.Cooldown, err)
+				}
+				cfg.Cooldown = d
+			}
+			if dp.IgnorePrivate != nil {
+				cfg.IgnorePrivate = *dp.IgnorePrivate
+			}
+		}
+	}
+
+	setFlags := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) {
+		setFlags[f.Name] = true
+	})
+
+	if setFlags["window"] {
+		cfg.Window = *df.window
+	}
+	if setFlags["vertical-threshold"] {
+		cfg.VerticalPortThreshold = *df.vertThresh
+	}
+	if setFlags["horizontal-threshold"] {
+		cfg.HorizontalHostThreshold = *df.horizThresh
+	}
+	if setFlags["burst-threshold"] {
+		cfg.BurstThreshold = *df.burstThresh
+	}
+	if setFlags["distributed-sources"] {
+		cfg.DistributedSourceThreshold = *df.distSources
+	}
+	if setFlags["distributed-ports"] {
+		cfg.DistributedPortThreshold = *df.distPorts
+	}
+	if setFlags["cooldown"] {
+		cfg.Cooldown = *df.cooldown
+	}
+	if setFlags["ignore-private"] {
+		cfg.IgnorePrivate = *df.ignorePrivate
+	}
+
+	return cfg, nil
 }
 
 func parseOptionalSeverity(raw string) (schema.Severity, error) {

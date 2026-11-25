@@ -69,5 +69,7 @@ detector:
   vertical_port_threshold: 10
   horizontal_host_threshold: 8
   burst_threshold: 25
+  distributed_source_threshold: 8
+  distributed_port_threshold: 10
   cooldown: "5m"
   ignore_private: true

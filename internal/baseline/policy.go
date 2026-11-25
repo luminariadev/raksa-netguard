@@ -65,12 +65,14 @@ type ForbiddenPort struct {
 
 // DetectorPolicy stores optional log-detector defaults inside a baseline policy file.
 type DetectorPolicy struct {
-	Window                  string `yaml:"window"`
-	VerticalPortThreshold   int    `yaml:"vertical_port_threshold"`
-	HorizontalHostThreshold int    `yaml:"horizontal_host_threshold"`
-	BurstThreshold          int    `yaml:"burst_threshold"`
-	Cooldown                string `yaml:"cooldown"`
-	IgnorePrivate           *bool  `yaml:"ignore_private,omitempty"`
+	Window                     string `yaml:"window"`
+	VerticalPortThreshold      int    `yaml:"vertical_port_threshold"`
+	HorizontalHostThreshold    int    `yaml:"horizontal_host_threshold"`
+	BurstThreshold             int    `yaml:"burst_threshold"`
+	DistributedSourceThreshold int    `yaml:"distributed_source_threshold"`
+	DistributedPortThreshold   int    `yaml:"distributed_port_threshold"`
+	Cooldown                   string `yaml:"cooldown"`
+	IgnorePrivate              *bool  `yaml:"ignore_private,omitempty"`
 }
 
 type portKey struct {

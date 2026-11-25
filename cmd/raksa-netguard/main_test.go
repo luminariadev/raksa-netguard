@@ -98,4 +98,28 @@ allowed_ports:
 			t.Fatalf("unexpected CLI JSON summary: %+v", rep.Summary)
 		}
 	})
+
+	t.Run("analyze supports policy defaults, distributed scan NET-104, and CLI flag override", func(t *testing.T) {
+		var out, errBuf bytes.Buffer
+		policyPath := filepath.Join("..", "..", "configs", "baseline.example.yaml")
+		distPath := filepath.Join("..", "..", "testdata", "distributed_scan.jsonl")
+
+		if code := run([]string{"analyze", "--policy", policyPath, "--log", distPath, "--format", "json", "--fail-on", "high"}, &out, &errBuf); code != exitThreshold {
+			t.Fatalf("expected exitThreshold (2) for distributed scan, got %d stderr=%s", code, errBuf.String())
+		}
+		var rep schema.Report
+		if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+			t.Fatalf("unmarshal distributed JSON report: %v", err)
+		}
+		if len(rep.Findings) != 1 || rep.Findings[0].RuleID != "NET-104" {
+			t.Fatalf("expected single NET-104 finding, got %+v", rep.Findings)
+		}
+
+		// Explicit CLI override (--distributed-sources 25) raises threshold above fixture count.
+		out.Reset()
+		errBuf.Reset()
+		if code := run([]string{"analyze", "--policy", policyPath, "--distributed-sources", "25", "--log", distPath, "--format", "json", "--fail-on", "high"}, &out, &errBuf); code != exitOK {
+			t.Fatalf("expected exitOK when CLI override raises threshold, got %d stderr=%s", code, errBuf.String())
+		}
+	})
 }
