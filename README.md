@@ -10,8 +10,8 @@
 
 Servers routinely drift from their intended network surface: a database binds to `0.0.0.0`, a legacy daemon opens an unapproved port, or external scanners sweep edge firewalls. `raksa-netguard` addresses both surfaces without background agents or active network probing:
 
-1. **Host Open-Port Baseline Auditing (`audit`, `policy-check`)**: Reads locally bound TCP/UDP sockets (`/proc/net/*` on Linux, `netstat -ano` on Windows) and checks them against a version-controlled YAML baseline policy.
-2. **Firewall & Flow Log Scan Detection (`analyze`, `watch`)**: Streams UFW, iptables, or JSONL flow records through a thread-safe sliding-window tracker to detect vertical port scans, horizontal sweeps, and connection bursts with per-rule cooldown deduplication.
+1. **Host Open-Port Baseline Auditing (`audit`, `policy-check`)**: Reads locally bound TCP/UDP sockets (`/proc/net/*` on Linux, `netstat -ano` on Windows), enriches findings with owning process names and PIDs, and checks them against a version-controlled YAML baseline policy.
+2. **Firewall & Flow Log Scan Detection (`analyze`, `watch`)**: Streams UFW, iptables, or JSONL flow records through a bounded sliding-window tracker to detect vertical port scans, horizontal sweeps, connection bursts, and distributed multi-source scans with per-rule cooldown deduplication.
 3. **CI/CD & SIEM Integration**: Emits human-readable tables, **Raksa Finding Schema v1** JSON, or **SARIF 2.1.0** for GitHub Code Scanning, with `--fail-on <severity>` exit codes (`2` on policy or detection breach).
 
 ## Hardening & Scope Boundaries
@@ -58,6 +58,10 @@ Servers routinely drift from their intended network surface: a database binds to
 See [docs/architecture.md](docs/architecture.md) and [docs/threat-model.md](docs/threat-model.md) for package design details and threat assumptions.
 
 ## Installation
+
+### Download Pre-built Binaries
+
+Grab checksum-verified archives (`linux/amd64`, `linux/arm64`, `darwin/arm64`, `windows/amd64`) from the [GitHub Releases](https://github.com/luminariadev/raksa-netguard/releases) page.
 
 ### Build from source (Go 1.26+)
 
@@ -119,10 +123,10 @@ HIGH      NET-002  tcp://0.0.0.0:445          Unauthorized listening port detect
 
 ### 3. Analyze firewall or flow logs (`analyze`)
 
-Detect vertical port scans, horizontal sweeps, and connection bursts across UFW, iptables, or JSONL logs:
+Detect vertical port scans, horizontal sweeps, connection bursts, and distributed multi-source scans across UFW, iptables, or JSONL logs. Pass `--policy` to load detector thresholds directly from your YAML baseline file:
 
 ```bash
-raksa-netguard analyze --log testdata/ufw_mixed.log --format table
+raksa-netguard analyze --policy configs/baseline.example.yaml --log testdata/ufw_mixed.log --format table
 ```
 
 Verified output:
@@ -135,6 +139,21 @@ HIGH      NET-101  ip://198.51.100.42->192.0.2.10  Vertical port scan detected
 HIGH      NET-102  ip://203.0.113.19->*:22         Horizontal network scan detected
 
 Summary: total=2 critical=0 high=2 medium=0 low=0 info=0
+```
+
+Distributed multi-source scan detection (`NET-104`) example:
+
+```bash
+raksa-netguard analyze --policy configs/baseline.example.yaml --log testdata/distributed_scan.jsonl --format table
+```
+
+```text
+Analyzed 12 lines (12 events parsed, 0 skipped, 0 parse errors)
+SEVERITY  RULE     TARGET             TITLE
+--------  ----     ------             -----
+HIGH      NET-104  host://192.0.2.50  Distributed multi-source port scan detected
+
+Summary: total=1 critical=0 high=1 medium=0 low=0 info=0
 ```
 
 JSON output (`--format json`) conforms to **Raksa Finding Schema v1**:
@@ -226,6 +245,7 @@ Upload baseline policy checks or host audit output directly to the GitHub Securi
 | `NET-101` | `high` | `scan-detector` | Vertical port scan across unique destination ports within window | `D3-NTA` |
 | `NET-102` | `high` | `scan-detector` | Horizontal sweep across unique destination hosts on one port | `D3-NTA` |
 | `NET-103` | `medium` | `scan-detector` | Connection attempt burst exceeding threshold within window | `D3-NTF` |
+| `NET-104` | `high` | `scan-detector` | Distributed multi-source scan targeting one destination host | `D3-NTA` |
 
 ## Baseline Policy Schema
 
