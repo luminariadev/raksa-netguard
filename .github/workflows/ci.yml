@@ -15,10 +15,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: '1.26.x'
           check-latest: true
@@ -37,6 +37,12 @@ jobs:
       - name: Validate bundled example policy
         run: go run ./cmd/raksa-netguard policy-check --policy configs/baseline.example.yaml --fail-on high
 
+      - name: Verify distributed scan fixture
+        run: |
+          out=$(go run ./cmd/raksa-netguard analyze --policy configs/baseline.example.yaml --log testdata/distributed_scan.jsonl --format table)
+          echo "$out"
+          echo "$out" | grep -q "NET-104"
+
       - name: Cross-compile release binaries
         run: |
           mkdir -p dist
@@ -49,7 +55,7 @@ jobs:
     needs: test
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Build distroless non-root image
         run: docker build -t raksa-netguard:ci .
