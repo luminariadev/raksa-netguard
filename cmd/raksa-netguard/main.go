@@ -10,17 +10,19 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"text/tabwriter"
 	"time"
 
 	"github.com/luminariadev/raksa-netguard/internal/baseline"
 	"github.com/luminariadev/raksa-netguard/internal/detector"
+	"github.com/luminariadev/raksa-netguard/internal/mcp"
 	"github.com/luminariadev/raksa-netguard/internal/notifier"
 	"github.com/luminariadev/raksa-netguard/internal/report"
 	"github.com/luminariadev/raksa-netguard/internal/schema"
 )
 
 var (
-	version   = "0.2.0"
+	version   = "0.3.0"
 	commit    = "dev"
 	buildDate = "unknown"
 )
@@ -42,6 +44,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	switch args[0] {
+	case "init":
+		return runInit(args[1:], stdout, stderr)
 	case "audit":
 		return runAudit(args[1:], stdout, stderr)
 	case "policy-check":
@@ -50,6 +54,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runAnalyze(args[1:], stdout, stderr)
 	case "watch":
 		return runWatch(args[1:], stdout, stderr)
+	case "rules":
+		return runRules(args[1:], stdout, stderr)
+	case "mcp":
+		return runMCP(args[1:], stdout, stderr)
 	case "version", "-v", "--version":
 		_, _ = fmt.Fprintf(stdout, "raksa-netguard %s (commit=%s, built=%s)\n", version, commit, buildDate)
 		return exitOK
@@ -70,10 +78,13 @@ Usage:
   raksa-netguard <command> [flags]
 
 Commands:
+  init           Generate a starter YAML baseline policy from local listening sockets
   audit          Audit local listening sockets against a YAML baseline policy
   policy-check   Validate a YAML baseline policy for permissive or insecure rules
   analyze        Analyze firewall or flow logs for port scans and connection bursts
   watch          Continuously tail a log file and emit alerts or webhook notifications
+  rules          List built-in defensive rules and MITRE D3FEND mappings
+  mcp            Run a stdio JSON-RPC 2.0 MCP server for agent integration
   version        Print build version metadata
   help           Show this help message
 
@@ -180,7 +191,7 @@ func runAnalyze(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 
 	logPath := fs.String("log", "", "Path to firewall/flow log file, or '-' for stdin (required)")
-	logFmt := fs.String("log-format", "auto", "Input log format: auto, ufw, iptables, jsonl")
+	logFmt := fs.String("log-format", "auto", "Input log format: auto, ufw, iptables, nftables, windows-fw, jsonl")
 	outFmt := fs.String("format", "table", "Output format: table, json, sarif")
 	failOnRaw := fs.String("fail-on", "", "Exit with code 2 if any finding meets severity (critical, high, medium, low, info)")
 	df := registerDetectorFlags(fs)
@@ -246,7 +257,7 @@ func runWatch(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 
 	logPath := fs.String("log", "", "Path to firewall/flow log file to tail (required)")
-	logFmt := fs.String("log-format", "auto", "Input log format: auto, ufw, iptables, jsonl")
+	logFmt := fs.String("log-format", "auto", "Input log format: auto, ufw, iptables, nftables, windows-fw, jsonl")
 	poll := fs.Duration("poll", 500*time.Millisecond, "Log polling interval")
 	df := registerDetectorFlags(fs)
 
@@ -301,6 +312,112 @@ func runWatch(args []string, stdout, stderr io.Writer) int {
 	})
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "watch error: %v\n", err)
+		return exitErr
+	}
+	return exitOK
+}
+
+func runInit(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("init", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	outPath := fs.String("out", "", "Write generated YAML policy to file path (prints to stdout if omitted)")
+	hostRole := fs.String("host-role", "server", "Host role label written into the generated policy")
+	timeout := fs.Duration("timeout", 10*time.Second, "Socket collection timeout")
+
+	if err := fs.Parse(args); err != nil {
+		return exitErr
+	}
+	if *timeout <= 0 {
+		_, _ = fmt.Fprintln(stderr, "error: --timeout must be positive")
+		return exitErr
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+
+	listeners, err := baseline.DefaultCollector().Collect(ctx)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "error collecting local listeners: %v\n", err)
+		return exitErr
+	}
+
+	pol, notes := baseline.GeneratePolicy(listeners, *hostRole)
+	rawYAML, err := baseline.MarshalPolicyYAML(pol)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "error serializing policy: %v\n", err)
+		return exitErr
+	}
+
+	for _, note := range notes {
+		_, _ = fmt.Fprintf(stderr, "review: %s\n", note)
+	}
+
+	if strings.TrimSpace(*outPath) != "" {
+		if err := os.WriteFile(*outPath, rawYAML, 0o600); err != nil {
+			_, _ = fmt.Fprintf(stderr, "error writing policy %q: %v\n", *outPath, err)
+			return exitErr
+		}
+		_, _ = fmt.Fprintf(stdout, "Generated baseline policy (%d allowed ports) at %s\n", len(pol.AllowedPorts), *outPath)
+		return exitOK
+	}
+
+	_, err = stdout.Write(rawYAML)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "error writing stdout: %v\n", err)
+		return exitErr
+	}
+	return exitOK
+}
+
+func runRules(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("rules", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	outFmt := fs.String("format", "table", "Output format: table, json")
+	if err := fs.Parse(args); err != nil {
+		return exitErr
+	}
+
+	rules := schema.RuleCatalog()
+	switch strings.ToLower(strings.TrimSpace(*outFmt)) {
+	case "", "table":
+		tw := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
+		_, _ = fmt.Fprintln(tw, "RULE\tSEVERITY\tMODULE\tD3FEND\tTITLE")
+		_, _ = fmt.Fprintln(tw, "----\t--------\t------\t------\t-----")
+		for _, r := range rules {
+			_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", r.RuleID, r.DefaultSeverity, r.Module, r.MitreD3FEND, r.Title)
+		}
+		_ = tw.Flush()
+		return exitOK
+	case "json":
+		enc := json.NewEncoder(stdout)
+		enc.SetEscapeHTML(false)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(map[string]any{"rules": rules}); err != nil {
+			_, _ = fmt.Fprintf(stderr, "error encoding rules: %v\n", err)
+			return exitErr
+		}
+		return exitOK
+	default:
+		_, _ = fmt.Fprintf(stderr, "unsupported format %q: expected table or json\n", *outFmt)
+		return exitErr
+	}
+}
+
+func runMCP(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	if err := fs.Parse(args); err != nil {
+		return exitErr
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	srv := mcp.NewServer(version, baseline.DefaultCollector())
+	if err := srv.Serve(ctx, os.Stdin, stdout); err != nil {
+		_, _ = fmt.Fprintf(stderr, "mcp server error: %v\n", err)
 		return exitErr
 	}
 	return exitOK

@@ -122,4 +122,64 @@ allowed_ports:
 			t.Fatalf("expected exitOK when CLI override raises threshold, got %d stderr=%s", code, errBuf.String())
 		}
 	})
+
+	t.Run("analyze supports Windows Defender Firewall pfirewall.log", func(t *testing.T) {
+		var out, errBuf bytes.Buffer
+		pfirewallPath := filepath.Join("..", "..", "testdata", "windows_pfirewall.log")
+		if code := run([]string{"analyze", "--log", pfirewallPath, "--log-format", "windows-fw", "--format", "table", "--fail-on", "high"}, &out, &errBuf); code != exitThreshold {
+			t.Fatalf("expected exitThreshold (2) on pfirewall scan, got %d stderr=%s", code, errBuf.String())
+		}
+		if !strings.Contains(out.String(), "NET-101") {
+			t.Fatalf("expected NET-101 in pfirewall output:\n%s", out.String())
+		}
+	})
+
+	t.Run("rules subcommand outputs table and json catalogs", func(t *testing.T) {
+		var out, errBuf bytes.Buffer
+		if code := run([]string{"rules", "--format", "table"}, &out, &errBuf); code != exitOK {
+			t.Fatalf("rules table exit=%d stderr=%s", code, errBuf.String())
+		}
+		if !strings.Contains(out.String(), "NET-001") || !strings.Contains(out.String(), "NET-104") {
+			t.Fatalf("rules table missing expected entries:\n%s", out.String())
+		}
+
+		out.Reset()
+		errBuf.Reset()
+		if code := run([]string{"rules", "--format", "json"}, &out, &errBuf); code != exitOK {
+			t.Fatalf("rules json exit=%d stderr=%s", code, errBuf.String())
+		}
+		var payload struct {
+			Rules []schema.RuleInfo `json:"rules"`
+		}
+		if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+			t.Fatalf("unmarshal rules json: %v", err)
+		}
+		if len(payload.Rules) != 10 {
+			t.Fatalf("expected 10 rules, got %d", len(payload.Rules))
+		}
+
+		if code := run([]string{"rules", "--format", "xml"}, &out, &errBuf); code != exitErr {
+			t.Fatalf("expected exitErr for unsupported rules format, got %d", code)
+		}
+	})
+
+	t.Run("init generates valid baseline policy file and rejects invalid timeout", func(t *testing.T) {
+		var out, errBuf bytes.Buffer
+		if code := run([]string{"init", "--timeout", "0s"}, &out, &errBuf); code != exitErr {
+			t.Fatalf("expected exitErr for non-positive timeout, got %d", code)
+		}
+
+		outFile := filepath.Join(t.TempDir(), "generated.yaml")
+		out.Reset()
+		errBuf.Reset()
+		if code := run([]string{"init", "--host-role", "ci-runner", "--out", outFile}, &out, &errBuf); code != exitOK {
+			t.Fatalf("init exit=%d stderr=%s", code, errBuf.String())
+		}
+		if !strings.Contains(out.String(), "Generated baseline policy") {
+			t.Fatalf("unexpected init output: %s", out.String())
+		}
+		if code := run([]string{"policy-check", "--policy", outFile}, &out, &errBuf); code != exitOK {
+			t.Fatalf("policy-check on generated baseline failed: code=%d stderr=%s", code, errBuf.String())
+		}
+	})
 }
