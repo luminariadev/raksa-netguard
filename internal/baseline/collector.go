@@ -23,6 +23,7 @@ type Listener struct {
 	Port        int
 	PID         string
 	ProcessName string
+	Inode       string
 	State       string
 }
 
@@ -84,7 +85,9 @@ func collectLinuxProcNet() ([]Listener, error) {
 	if !parsedAny && firstErr != nil {
 		return nil, fmt.Errorf("read /proc/net tables: %w", firstErr)
 	}
-	return sortAndDeduplicateListeners(all), nil
+	deduped := sortAndDeduplicateListeners(all)
+	EnrichLinuxProcesses("/proc", deduped)
+	return deduped, nil
 }
 
 func collectWindowsNetstat(ctx context.Context) ([]Listener, error) {
@@ -93,7 +96,12 @@ func collectWindowsNetstat(ctx context.Context) ([]Listener, error) {
 	if err != nil {
 		return nil, fmt.Errorf("run netstat -ano: %w", err)
 	}
-	return ParseNetstatOutput(bytes.NewReader(out))
+	listeners, err := ParseNetstatOutput(bytes.NewReader(out))
+	if err != nil {
+		return nil, err
+	}
+	enrichWindowsProcesses(ctx, listeners)
+	return listeners, nil
 }
 
 // ParseProcNet parses Linux /proc/net/{tcp,tcp6,udp,udp6} socket tables.
@@ -146,10 +154,16 @@ func ParseProcNet(r io.Reader, proto string) ([]Listener, error) {
 			stateLabel = "BOUND"
 		}
 
+		var inode string
+		if len(fields) > 9 && fields[9] != "0" {
+			inode = fields[9]
+		}
+
 		listeners = append(listeners, Listener{
 			Protocol: normProto,
 			BindAddr: ipStr,
 			Port:     port,
+			Inode:    inode,
 			State:    stateLabel,
 		})
 	}

@@ -53,7 +53,7 @@ func Audit(listeners []Listener, policy *Policy, now time.Time) []schema.Finding
 				Description: desc,
 				Target:      target,
 				Evidence:    listenerEvidence(l),
-				Remediation: fmt.Sprintf("Stop and disable the process listening on %d/%s (PID %s) and block the port at the host firewall.", l.Port, key.proto, fallbackPID(l.PID)),
+				Remediation: fmt.Sprintf("Stop and disable %s listening on %d/%s and block the port at the host firewall.", formatProcessRef(l), l.Port, key.proto),
 				MitreD3FEND: "D3-NI",
 				Timestamp:   now,
 			})
@@ -78,7 +78,7 @@ func Audit(listeners []Listener, policy *Policy, now time.Time) []schema.Finding
 				Description: fmt.Sprintf("Active socket %d/%s on %s is not authorized in baseline allowed_ports.", l.Port, key.proto, l.BindAddr),
 				Target:      target,
 				Evidence:    listenerEvidence(l),
-				Remediation: fmt.Sprintf("Verify whether PID %s requires %d/%s; either terminate the service or register an explicit allowed_ports entry with restricted allowed_binds.", fallbackPID(l.PID), l.Port, key.proto),
+				Remediation: fmt.Sprintf("Verify whether %s requires %d/%s; either terminate the service or register an explicit allowed_ports entry with restricted allowed_binds.", formatProcessRef(l), l.Port, key.proto),
 				MitreD3FEND: "D3-HBPI",
 				Timestamp:   now,
 			})
@@ -185,6 +185,14 @@ func formatSocketTarget(l Listener) string {
 func findingID(prefix, proto, addr string, port int) string {
 	cleanAddr := strings.NewReplacer(":", "_", ".", "-").Replace(addr)
 	return fmt.Sprintf("%s-%s-%s-%d", prefix, proto, cleanAddr, port)
+}
+
+func formatProcessRef(l Listener) string {
+	pid := fallbackPID(l.PID)
+	if strings.TrimSpace(l.ProcessName) != "" {
+		return fmt.Sprintf("%s (PID %s)", l.ProcessName, pid)
+	}
+	return fmt.Sprintf("PID %s", pid)
 }
 
 func fallbackPID(pid string) string {

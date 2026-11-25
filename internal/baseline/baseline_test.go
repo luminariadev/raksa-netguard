@@ -161,10 +161,10 @@ func TestParseProcNet(t *testing.T) {
 		if len(got) != 2 {
 			t.Fatalf("expected 2 listeners, got %+v", got)
 		}
-		if got[0].BindAddr != "0.0.0.0" || got[0].Port != 443 {
+		if got[0].BindAddr != "0.0.0.0" || got[0].Port != 443 || got[0].Inode != "12346" {
 			t.Fatalf("unexpected first listener: %+v", got[0])
 		}
-		if got[1].BindAddr != "127.0.0.1" || got[1].Port != 8080 {
+		if got[1].BindAddr != "127.0.0.1" || got[1].Port != 8080 || got[1].Inode != "12345" {
 			t.Fatalf("unexpected second listener: %+v", got[1])
 		}
 	})
@@ -344,6 +344,78 @@ func TestWildcardAndPolicySizeHardening(t *testing.T) {
 	if _, err := LoadPolicy(oversizedPath); err == nil || !strings.Contains(err.Error(), "exceeds maximum size") {
 		t.Fatalf("expected oversized policy error, got %v", err)
 	}
+}
+
+func TestProcessEnrichment(t *testing.T) {
+	t.Run("parses Windows tasklist CSV and applies process names", func(t *testing.T) {
+		sample := `"System Idle Process","0","Services","0","8 K"
+"svchost.exe","1820","Services","0","18,432 K"
+"postgres.exe","4400","Console","1","45,100 K"
+"badrow"
+"notapid","abc","Console","1","1 K"
+`
+		pidMap := ParseTasklistCSV(strings.NewReader(sample))
+		if pidMap["1820"] != "svchost.exe" || pidMap["4400"] != "postgres.exe" {
+			t.Fatalf("unexpected tasklist map: %+v", pidMap)
+		}
+		if _, exists := pidMap["abc"]; exists {
+			t.Fatalf("non-numeric PID should be ignored: %+v", pidMap)
+		}
+
+		listeners := []Listener{
+			{Protocol: "tcp", BindAddr: "0.0.0.0", Port: 135, PID: "1820", State: "LISTENING"},
+		}
+		applyProcessByPID(listeners, pidMap)
+		if listeners[0].ProcessName != "svchost.exe" {
+			t.Fatalf("expected svchost.exe, got %q", listeners[0].ProcessName)
+		}
+
+		findings := Audit(listeners, &Policy{Version: "1.0"}, time.Now().UTC())
+		if len(findings) != 1 || !strings.Contains(findings[0].Remediation, "svchost.exe (PID 1820)") {
+			t.Fatalf("expected process name in remediation, got %+v", findings)
+		}
+		if findings[0].Evidence["process"] != "svchost.exe" {
+			t.Fatalf("expected process in evidence, got %+v", findings[0].Evidence)
+		}
+	})
+
+	t.Run("parses socket inode links and resolves Linux procfs tree", func(t *testing.T) {
+		if inode, ok := parseSocketInodeLink("socket:[12346]"); !ok || inode != "12346" {
+			t.Fatalf("expected inode 12346, got %q (ok=%v)", inode, ok)
+		}
+		if _, ok := parseSocketInodeLink("/dev/null"); ok {
+			t.Fatal("non-socket symlink should not match")
+		}
+
+		listeners := []Listener{
+			{Protocol: "tcp", BindAddr: "0.0.0.0", Port: 443, Inode: "12346", State: "LISTENING"},
+		}
+		applyProcessByInode(listeners, map[string]ProcessMeta{
+			"12346": {PID: "910", Name: "nginx"},
+		})
+		if listeners[0].PID != "910" || listeners[0].ProcessName != "nginx" {
+			t.Fatalf("expected PID 910 and nginx, got %+v", listeners[0])
+		}
+
+		// Also verify directory walking against synthetic procfs when symlinks are permitted.
+		procRoot := t.TempDir()
+		fdDir := filepath.Join(procRoot, "2020", "fd")
+		if err := os.MkdirAll(fdDir, 0o755); err != nil {
+			t.Fatalf("mkdir synthetic proc: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(procRoot, "2020", "comm"), []byte("sshd\n"), 0o600); err != nil {
+			t.Fatalf("write comm: %v", err)
+		}
+		if err := os.Symlink("socket:[77777]", filepath.Join(fdDir, "3")); err == nil {
+			procListeners := []Listener{
+				{Protocol: "tcp", BindAddr: "0.0.0.0", Port: 22, Inode: "77777", State: "LISTENING"},
+			}
+			EnrichLinuxProcesses(procRoot, procListeners)
+			if procListeners[0].PID != "2020" || procListeners[0].ProcessName != "sshd" {
+				t.Fatalf("expected EnrichLinuxProcesses to resolve PID 2020 sshd, got %+v", procListeners[0])
+			}
+		}
+	})
 }
 
 func writeTempPolicy(t *testing.T, path, content string) {
