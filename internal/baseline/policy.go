@@ -96,15 +96,28 @@ func LoadPolicy(path string) (*Policy, error) {
 		return nil, fmt.Errorf("policy %q exceeds maximum size of %d bytes", path, maxPolicyBytes)
 	}
 
+	p, err := ParsePolicyYAML(data)
+	if err != nil {
+		return nil, fmt.Errorf("policy %q: %w", path, err)
+	}
+	return p, nil
+}
+
+// ParsePolicyYAML parses and validates raw YAML baseline bytes (capped at 1 MiB).
+func ParsePolicyYAML(data []byte) (*Policy, error) {
+	if len(data) > maxPolicyBytes {
+		return nil, fmt.Errorf("policy exceeds maximum size of %d bytes", maxPolicyBytes)
+	}
+
 	var p Policy
 	dec := yaml.NewDecoder(strings.NewReader(string(data)))
 	dec.KnownFields(true)
 	if err := dec.Decode(&p); err != nil {
-		return nil, fmt.Errorf("parse policy %q: %w", path, err)
+		return nil, fmt.Errorf("parse policy: %w", err)
 	}
 
 	if err := p.normalizeAndValidate(); err != nil {
-		return nil, fmt.Errorf("invalid policy %q: %w", path, err)
+		return nil, fmt.Errorf("invalid policy: %w", err)
 	}
 	return &p, nil
 }

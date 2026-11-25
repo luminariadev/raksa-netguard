@@ -418,6 +418,52 @@ func TestProcessEnrichment(t *testing.T) {
 	})
 }
 
+func TestGeneratePolicyAndRoundTrip(t *testing.T) {
+	listeners := []Listener{
+		{Protocol: "tcp", BindAddr: "0.0.0.0", Port: 443, ProcessName: "nginx", State: "LISTENING"},
+		{Protocol: "tcp", BindAddr: "::", Port: 443, ProcessName: "nginx", State: "LISTENING"},
+		{Protocol: "tcp", BindAddr: "0.0.0.0", Port: 5432, ProcessName: "postgres", State: "LISTENING"},
+		{Protocol: "tcp", BindAddr: "127.0.0.1", Port: 6379, ProcessName: "redis-server", State: "LISTENING"},
+	}
+
+	policy, notes := GeneratePolicy(listeners, "api-node")
+	if policy.HostRole != "api-node" || len(policy.AllowedPorts) != 3 {
+		t.Fatalf("unexpected generated policy: %+v", policy)
+	}
+	if len(notes) != 1 || !strings.Contains(notes[0], "postgresql") {
+		t.Fatalf("expected review note for wildcard postgres, got %+v", notes)
+	}
+
+	rawYAML, err := MarshalPolicyYAML(policy)
+	if err != nil {
+		t.Fatalf("MarshalPolicyYAML: %v", err)
+	}
+
+	parsed, err := ParsePolicyYAML(rawYAML)
+	if err != nil {
+		t.Fatalf("ParsePolicyYAML round-trip failed: %v\n%s", err, string(rawYAML))
+	}
+
+	// Wildcard sensitive service (5432) still triggers NET-004 until operator secures or explicitly approves it.
+	drift := Audit(listeners, parsed, time.Now().UTC())
+	if len(drift) != 1 || drift[0].RuleID != "NET-004" {
+		t.Fatalf("expected 1 NET-004 review finding on wildcard postgres, got %+v", drift)
+	}
+
+	// Non-wildcard listeners produce 0 drift findings against their generated baseline.
+	safeListeners := []Listener{
+		{Protocol: "tcp", BindAddr: "0.0.0.0", Port: 443, ProcessName: "nginx", State: "LISTENING"},
+		{Protocol: "tcp", BindAddr: "127.0.0.1", Port: 5432, ProcessName: "postgres", State: "LISTENING"},
+	}
+	safePol, safeNotes := GeneratePolicy(safeListeners, "api-node")
+	if len(safeNotes) != 0 {
+		t.Fatalf("expected 0 notes for loopback postgres, got %+v", safeNotes)
+	}
+	if safeDrift := Audit(safeListeners, safePol, time.Now().UTC()); len(safeDrift) != 0 {
+		t.Fatalf("expected 0 drift findings for loopback baseline, got %+v", safeDrift)
+	}
+}
+
 func writeTempPolicy(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {

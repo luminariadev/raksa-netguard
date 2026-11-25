@@ -90,3 +90,20 @@ func TestNewReportAndThresholdBreach(t *testing.T) {
 		}
 	})
 }
+
+func TestRuleCatalog(t *testing.T) {
+	rules := RuleCatalog()
+	if len(rules) != 10 {
+		t.Fatalf("expected 10 rules in catalog, got %d", len(rules))
+	}
+	seen := make(map[string]bool, len(rules))
+	for _, r := range rules {
+		if r.RuleID == "" || r.Title == "" || r.MitreD3FEND == "" || r.Description == "" {
+			t.Fatalf("incomplete rule metadata: %+v", r)
+		}
+		if seen[r.RuleID] {
+			t.Fatalf("duplicate rule ID in catalog: %s", r.RuleID)
+		}
+		seen[r.RuleID] = true
+	}
+}
