@@ -17,27 +17,33 @@ const moduleDetector = "scan-detector"
 
 // Config controls sliding-window scan detection thresholds and suppression.
 type Config struct {
-	Window                  time.Duration
-	VerticalPortThreshold   int
-	HorizontalHostThreshold int
-	BurstThreshold          int
-	Cooldown                time.Duration
-	IgnorePrivate           bool
-	MaxTrackedSources       int
-	MaxEventsPerSource      int
+	Window                     time.Duration
+	VerticalPortThreshold      int
+	HorizontalHostThreshold    int
+	BurstThreshold             int
+	DistributedSourceThreshold int
+	DistributedPortThreshold   int
+	Cooldown                   time.Duration
+	IgnorePrivate              bool
+	MaxTrackedSources          int
+	MaxTrackedTargets          int
+	MaxEventsPerSource         int
 }
 
 // DefaultConfig returns defensive detection defaults suitable for typical edge/API nodes.
 func DefaultConfig() Config {
 	return Config{
-		Window:                  60 * time.Second,
-		VerticalPortThreshold:   10,
-		HorizontalHostThreshold: 8,
-		BurstThreshold:          25,
-		Cooldown:                5 * time.Minute,
-		IgnorePrivate:           true,
-		MaxTrackedSources:       10000,
-		MaxEventsPerSource:      1000,
+		Window:                     60 * time.Second,
+		VerticalPortThreshold:      10,
+		HorizontalHostThreshold:    8,
+		BurstThreshold:             25,
+		DistributedSourceThreshold: 8,
+		DistributedPortThreshold:   10,
+		Cooldown:                   5 * time.Minute,
+		IgnorePrivate:              true,
+		MaxTrackedSources:          10000,
+		MaxTrackedTargets:          1000,
+		MaxEventsPerSource:         1000,
 	}
 }
 
@@ -55,11 +61,20 @@ func (c Config) withDefaults() Config {
 	if c.BurstThreshold <= 0 {
 		c.BurstThreshold = d.BurstThreshold
 	}
+	if c.DistributedSourceThreshold <= 0 {
+		c.DistributedSourceThreshold = d.DistributedSourceThreshold
+	}
+	if c.DistributedPortThreshold <= 0 {
+		c.DistributedPortThreshold = d.DistributedPortThreshold
+	}
 	if c.Cooldown < 0 {
 		c.Cooldown = d.Cooldown
 	}
 	if c.MaxTrackedSources <= 0 {
 		c.MaxTrackedSources = d.MaxTrackedSources
+	}
+	if c.MaxTrackedTargets <= 0 {
+		c.MaxTrackedTargets = d.MaxTrackedTargets
 	}
 	if c.MaxEventsPerSource <= 0 {
 		c.MaxEventsPerSource = d.MaxEventsPerSource
@@ -85,11 +100,12 @@ type sourceWindow struct {
 	events []Event
 }
 
-// Detector tracks per-source network telemetry over a bounded sliding window.
+// Detector tracks per-source and per-target network telemetry over bounded sliding windows.
 type Detector struct {
 	cfg       Config
 	mu        sync.Mutex
 	sources   map[string]*sourceWindow
+	targets   map[string]*sourceWindow
 	lastAlert map[alertKey]time.Time
 }
 
@@ -98,6 +114,7 @@ func New(cfg Config) *Detector {
 	return &Detector{
 		cfg:       cfg.withDefaults(),
 		sources:   make(map[string]*sourceWindow),
+		targets:   make(map[string]*sourceWindow),
 		lastAlert: make(map[alertKey]time.Time),
 	}
 }
@@ -121,49 +138,64 @@ func (d *Detector) Ingest(ev Event) []schema.Finding {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	sw, ok := d.sources[ev.SrcIP]
-	if !ok {
-		if len(d.sources) >= d.cfg.MaxTrackedSources {
-			d.evictCapacityLocked(ts)
-		}
-		sw = &sourceWindow{}
-		d.sources[ev.SrcIP] = sw
-	}
-
-	if ts.After(sw.latest) {
-		sw.latest = ts
-	}
-	cutoff := sw.latest.Add(-d.cfg.Window)
-	if ts.Before(cutoff) {
-		// Drop events older than the active sliding window.
-		return nil
-	}
-
-	sw.events = append(sw.events, ev)
-	sw.events = pruneEvents(sw.events, cutoff)
-	if len(sw.events) > d.cfg.MaxEventsPerSource {
-		sw.events = sw.events[len(sw.events)-d.cfg.MaxEventsPerSource:]
+	sw := d.appendWindowEventLocked(d.sources, ev.SrcIP, ev, ts, d.cfg.MaxTrackedSources)
+	var tw *sourceWindow
+	if ev.DstIP != "" && ev.DstPort > 0 {
+		tw = d.appendWindowEventLocked(d.targets, ev.DstIP, ev, ts, d.cfg.MaxTrackedTargets)
 	}
 
 	var findings []schema.Finding
-
-	if f, triggered := d.checkVerticalScan(ev, sw.events); triggered {
-		findings = append(findings, f)
+	if sw != nil {
+		if f, triggered := d.checkVerticalScan(ev, sw.events); triggered {
+			findings = append(findings, f)
+		}
+		if f, triggered := d.checkHorizontalScan(ev, sw.events); triggered {
+			findings = append(findings, f)
+		}
+		if f, triggered := d.checkBurst(ev, sw.events); triggered {
+			findings = append(findings, f)
+		}
 	}
-	if f, triggered := d.checkHorizontalScan(ev, sw.events); triggered {
-		findings = append(findings, f)
-	}
-	if f, triggered := d.checkBurst(ev, sw.events); triggered {
-		findings = append(findings, f)
+	if tw != nil {
+		if f, triggered := d.checkDistributedScan(ev, tw.events); triggered {
+			findings = append(findings, f)
+		}
 	}
 
 	return findings
 }
 
-func (d *Detector) evictCapacityLocked(now time.Time) {
-	for ip, sw := range d.sources {
+func (d *Detector) appendWindowEventLocked(store map[string]*sourceWindow, key string, ev Event, ts time.Time, maxTracked int) *sourceWindow {
+	w, ok := store[key]
+	if !ok {
+		if len(store) >= maxTracked {
+			d.evictWindowMapLocked(store, maxTracked, ts)
+		}
+		w = &sourceWindow{}
+		store[key] = w
+	}
+
+	if ts.After(w.latest) {
+		w.latest = ts
+	}
+	cutoff := w.latest.Add(-d.cfg.Window)
+	if ts.Before(cutoff) {
+		// Drop events older than the active sliding window.
+		return nil
+	}
+
+	w.events = append(w.events, ev)
+	w.events = pruneEvents(w.events, cutoff)
+	if len(w.events) > d.cfg.MaxEventsPerSource {
+		w.events = w.events[len(w.events)-d.cfg.MaxEventsPerSource:]
+	}
+	return w
+}
+
+func (d *Detector) evictWindowMapLocked(store map[string]*sourceWindow, maxTracked int, now time.Time) {
+	for k, sw := range store {
 		if now.Sub(sw.latest) > d.cfg.Window {
-			delete(d.sources, ip)
+			delete(store, k)
 		}
 	}
 	if d.cfg.Cooldown > 0 {
@@ -173,19 +205,19 @@ func (d *Detector) evictCapacityLocked(now time.Time) {
 			}
 		}
 	}
-	for len(d.sources) >= d.cfg.MaxTrackedSources {
-		var oldestIP string
+	for len(store) >= maxTracked {
+		var oldestKey string
 		var oldestTime time.Time
 		first := true
-		for ip, sw := range d.sources {
+		for k, sw := range store {
 			if first || sw.latest.Before(oldestTime) {
-				oldestIP = ip
+				oldestKey = k
 				oldestTime = sw.latest
 				first = false
 			}
 		}
 		if !first {
-			delete(d.sources, oldestIP)
+			delete(store, oldestKey)
 		} else {
 			break
 		}
@@ -354,6 +386,63 @@ func (d *Detector) checkBurst(latest Event, events []Event) (schema.Finding, boo
 		},
 		Remediation: fmt.Sprintf("Apply connection rate limiting or fail2ban rules targeting %s if traffic is unexpected.", latest.SrcIP),
 		MitreD3FEND: "D3-NTF",
+		Timestamp:   latest.Timestamp,
+	}, true
+}
+
+func (d *Detector) checkDistributedScan(latest Event, events []Event) (schema.Finding, bool) {
+	if latest.DstIP == "" || latest.DstPort <= 0 {
+		return schema.Finding{}, false
+	}
+
+	srcSet := make(map[string]struct{})
+	portSet := make(map[int]struct{})
+	for _, e := range events {
+		if e.SrcIP != "" {
+			srcSet[e.SrcIP] = struct{}{}
+		}
+		if e.DstPort > 0 {
+			portSet[e.DstPort] = struct{}{}
+		}
+	}
+
+	if len(srcSet) < d.cfg.DistributedSourceThreshold || len(portSet) < d.cfg.DistributedPortThreshold {
+		return schema.Finding{}, false
+	}
+	if !d.canEmit("dst:"+latest.DstIP, "NET-104", latest.Timestamp) {
+		return schema.Finding{}, false
+	}
+
+	uniqueSources := stringKeysSorted(srcSet)
+	sampleSources := uniqueSources
+	if len(sampleSources) > 10 {
+		sampleSources = sampleSources[:10]
+	}
+	uniquePorts := mapKeysSorted(portSet)
+	samplePorts := uniquePorts
+	if len(samplePorts) > 15 {
+		samplePorts = samplePorts[:15]
+	}
+
+	return schema.Finding{
+		ID:          fmt.Sprintf("net-104-%s-%d", sanitizeIPForID(latest.DstIP), latest.Timestamp.Unix()),
+		RuleID:      "NET-104",
+		Module:      moduleDetector,
+		Layer:       schema.LayerNetwork,
+		Severity:    schema.SeverityHigh,
+		Title:       "Distributed multi-source port scan detected",
+		Description: fmt.Sprintf("Target %s received probes from %d distinct source IPs across %d distinct ports within %s.", latest.DstIP, len(uniqueSources), len(uniquePorts), d.cfg.Window),
+		Target:      fmt.Sprintf("host://%s", latest.DstIP),
+		Evidence: map[string]any{
+			"dst_ip":         latest.DstIP,
+			"unique_sources": len(uniqueSources),
+			"unique_ports":   len(uniquePorts),
+			"sample_sources": sampleSources,
+			"sample_ports":   samplePorts,
+			"window":         d.cfg.Window.String(),
+		},
+		Remediation: fmt.Sprintf("Inspect perimeter firewall logs for %s, correlate probing source ranges, and enforce strict ingress allowlists.", latest.DstIP),
+		MitreD3FEND: "D3-NTA",
 		Timestamp:   latest.Timestamp,
 	}, true
 }

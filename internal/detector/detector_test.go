@@ -483,3 +483,55 @@ func TestAdversarialResilience(t *testing.T) {
 		}
 	})
 }
+
+func TestDetector_DistributedScanNET104(t *testing.T) {
+	t.Run("detects distributed multi-source scan fixture without single-source false triggers", func(t *testing.T) {
+		f, err := os.Open(filepath.Join("..", "..", "testdata", "distributed_scan.jsonl"))
+		if err != nil {
+			t.Fatalf("open distributed_scan fixture: %v", err)
+		}
+		defer f.Close()
+
+		det := New(DefaultConfig())
+		findings, stats, err := det.AnalyzeReader(f, "jsonl")
+		if err != nil {
+			t.Fatalf("AnalyzeReader: %v", err)
+		}
+		if stats.EventsParsed != 12 {
+			t.Fatalf("expected 12 parsed events, got %+v", stats)
+		}
+		if len(findings) != 1 || findings[0].RuleID != "NET-104" {
+			t.Fatalf("expected exactly 1 NET-104 finding (cooldown deduplicated), got %+v", findings)
+		}
+		if findings[0].Target != "host://192.0.2.50" || findings[0].MitreD3FEND != "D3-NTA" {
+			t.Fatalf("unexpected NET-104 metadata: %+v", findings[0])
+		}
+	})
+
+	t.Run("bounds tracked targets under destination IP flood", func(t *testing.T) {
+		det := New(Config{
+			Window:                     30 * time.Second,
+			DistributedSourceThreshold: 8,
+			DistributedPortThreshold:   10,
+			MaxTrackedTargets:          16,
+		})
+
+		base := time.Date(2026, 11, 25, 16, 30, 0, 0, time.UTC)
+		for i := 0; i < 60; i++ {
+			_ = det.Ingest(Event{
+				Timestamp: base.Add(time.Duration(i) * time.Millisecond),
+				SrcIP:     "198.51.100.1",
+				DstIP:     fmt.Sprintf("192.0.2.%d", i+1),
+				DstPort:   443,
+				Protocol:  "TCP",
+			})
+		}
+
+		det.mu.Lock()
+		targetCount := len(det.targets)
+		det.mu.Unlock()
+		if targetCount > 16 {
+			t.Fatalf("expected tracked targets <= 16, got %d", targetCount)
+		}
+	})
+}
