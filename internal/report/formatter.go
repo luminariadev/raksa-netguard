@@ -72,6 +72,7 @@ func FormatTable(w io.Writer, rep schema.Report) error {
 // FormatJSON renders the canonical Raksa Finding Schema v1 JSON report.
 func FormatJSON(w io.Writer, rep schema.Report) error {
 	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
 	enc.SetIndent("", "  ")
 	return enc.Encode(rep)
 }
@@ -202,6 +203,7 @@ func FormatSARIF(w io.Writer, rep schema.Report) error {
 	}
 
 	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
 	enc.SetIndent("", "  ")
 	return enc.Encode(doc)
 }

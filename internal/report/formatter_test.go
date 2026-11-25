@@ -34,7 +34,7 @@ func TestFormatters(t *testing.T) {
 			Severity:    schema.SeverityMedium,
 			Title:       "Connection burst anomaly detected",
 			Description: "Burst from 198.51.100.77.",
-			Target:      "ip://198.51.100.77",
+			Target:      "ip://198.51.100.77->192.0.2.20",
 			Remediation: "Apply rate limit.",
 			MitreD3FEND: "D3-NTF",
 			Timestamp:   now,
@@ -76,6 +76,9 @@ func TestFormatters(t *testing.T) {
 		}
 		if decoded.SchemaVersion != "1.0" || decoded.Summary.Total != 2 || decoded.Summary.Critical != 1 {
 			t.Fatalf("unexpected decoded JSON report: %+v", decoded)
+		}
+		if strings.Contains(buf.String(), `\u003e`) {
+			t.Fatalf("JSON output should not escape '>' characters:\n%s", buf.String())
 		}
 	})
 
