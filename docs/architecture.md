@@ -1,4 +1,4 @@
-# Architecture — raksa-netguard
+# raksa-netguard Architecture
 
 `raksa-netguard` is the Layer 1 (Network Defense) component of the Raksa security suite. It operates purely defensively on the local host and local telemetry streams through two independent pipelines that converge on a unified reporting and notification interface.
 

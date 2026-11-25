@@ -8,11 +8,11 @@
 
 ## Overview
 
-Servers routinely drift from their intended network surface—a database binds to `0.0.0.0`, a legacy daemon opens an unapproved port, or external scanners sweep edge firewalls. `raksa-netguard` addresses both surfaces without background agents or active network probing:
+Servers routinely drift from their intended network surface: a database binds to `0.0.0.0`, a legacy daemon opens an unapproved port, or external scanners sweep edge firewalls. `raksa-netguard` addresses both surfaces without background agents or active network probing:
 
-1. **Host Open-Port Baseline Auditing (`audit`, `policy-check`)** — Reads locally bound TCP/UDP sockets (`/proc/net/*` on Linux, `netstat -ano` on Windows) and checks them against a version-controlled YAML baseline policy.
-2. **Firewall & Flow Log Scan Detection (`analyze`, `watch`)** — Streams UFW, iptables, or JSONL flow records through a thread-safe sliding-window tracker to detect vertical port scans, horizontal sweeps, and connection bursts with per-rule cooldown deduplication.
-3. **CI/CD & SIEM Integration** — Emits human-readable tables, **Raksa Finding Schema v1** JSON, or **SARIF 2.1.0** for GitHub Code Scanning, with `--fail-on <severity>` exit codes (`2` on policy or detection breach).
+1. **Host Open-Port Baseline Auditing (`audit`, `policy-check`)**: Reads locally bound TCP/UDP sockets (`/proc/net/*` on Linux, `netstat -ano` on Windows) and checks them against a version-controlled YAML baseline policy.
+2. **Firewall & Flow Log Scan Detection (`analyze`, `watch`)**: Streams UFW, iptables, or JSONL flow records through a thread-safe sliding-window tracker to detect vertical port scans, horizontal sweeps, and connection bursts with per-rule cooldown deduplication.
+3. **CI/CD & SIEM Integration**: Emits human-readable tables, **Raksa Finding Schema v1** JSON, or **SARIF 2.1.0** for GitHub Code Scanning, with `--fail-on <severity>` exit codes (`2` on policy or detection breach).
 
 ## Hardening & Scope Boundaries
 

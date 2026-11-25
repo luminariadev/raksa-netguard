@@ -1,4 +1,4 @@
-# Threat Model — raksa-netguard
+# raksa-netguard Threat Model
 
 ## Defensive Scope
 

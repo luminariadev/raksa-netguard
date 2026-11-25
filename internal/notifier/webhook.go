@@ -130,7 +130,7 @@ func (s *WebhookSink) postOnce(ctx context.Context, body []byte) (int, error) {
 }
 
 func (s *WebhookSink) buildPayload(f schema.Finding) ([]byte, error) {
-	summary := fmt.Sprintf("[%s] %s (%s) — %s | Target: %s | MITRE: %s",
+	summary := fmt.Sprintf("[%s] %s (%s) - %s | Target: %s | MITRE: %s",
 		strings.ToUpper(string(f.Severity)),
 		f.RuleID,
 		f.Title,
