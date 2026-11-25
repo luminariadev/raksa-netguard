@@ -2,6 +2,7 @@ package baseline
 
 import (
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strings"
@@ -11,7 +12,10 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const moduleBaseline = "baseline-auditor"
+const (
+	moduleBaseline = "baseline-auditor"
+	maxPolicyBytes = 1 << 20 // 1 MiB cap prevents YAML memory exhaustion on untrusted files
+)
 
 var sensitivePorts = map[int]string{
 	22:    "ssh",
@@ -76,9 +80,18 @@ type portKey struct {
 
 // LoadPolicy reads, parses, and validates a YAML baseline policy from disk.
 func LoadPolicy(path string) (*Policy, error) {
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("read policy %q: %w", path, err)
+	}
+	defer f.Close()
+
+	data, err := io.ReadAll(io.LimitReader(f, maxPolicyBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read policy %q: %w", path, err)
+	}
+	if len(data) > maxPolicyBytes {
+		return nil, fmt.Errorf("policy %q exceeds maximum size of %d bytes", path, maxPolicyBytes)
 	}
 
 	var p Policy
@@ -238,13 +251,20 @@ func normalizeBindAddr(addr string) string {
 	if s == "*" {
 		return "0.0.0.0"
 	}
+	if ip := net.ParseIP(s); ip != nil {
+		return ip.String()
+	}
 	return s
 }
 
 // IsWildcardBind reports whether addr listens on all interfaces (IPv4 or IPv6).
 func IsWildcardBind(addr string) bool {
 	norm := normalizeBindAddr(addr)
-	return norm == "0.0.0.0" || norm == "::" || norm == "::0"
+	if norm == "0.0.0.0" || norm == "::" || norm == "::0" {
+		return true
+	}
+	ip := net.ParseIP(norm)
+	return ip != nil && ip.IsUnspecified()
 }
 
 // IsSensitivePort reports whether port corresponds to a well-known administrative or datastore service.

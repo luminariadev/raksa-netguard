@@ -23,6 +23,8 @@ type Config struct {
 	BurstThreshold          int
 	Cooldown                time.Duration
 	IgnorePrivate           bool
+	MaxTrackedSources       int
+	MaxEventsPerSource      int
 }
 
 // DefaultConfig returns defensive detection defaults suitable for typical edge/API nodes.
@@ -34,6 +36,8 @@ func DefaultConfig() Config {
 		BurstThreshold:          25,
 		Cooldown:                5 * time.Minute,
 		IgnorePrivate:           true,
+		MaxTrackedSources:       10000,
+		MaxEventsPerSource:      1000,
 	}
 }
 
@@ -53,6 +57,12 @@ func (c Config) withDefaults() Config {
 	}
 	if c.Cooldown < 0 {
 		c.Cooldown = d.Cooldown
+	}
+	if c.MaxTrackedSources <= 0 {
+		c.MaxTrackedSources = d.MaxTrackedSources
+	}
+	if c.MaxEventsPerSource <= 0 {
+		c.MaxEventsPerSource = d.MaxEventsPerSource
 	}
 	return c
 }
@@ -94,6 +104,8 @@ func New(cfg Config) *Detector {
 
 // Ingest processes a single Event and returns any triggered scan or anomaly findings.
 func (d *Detector) Ingest(ev Event) []schema.Finding {
+	ev.SrcIP = canonicalIPString(ev.SrcIP)
+	ev.DstIP = canonicalIPString(ev.DstIP)
 	if ev.SrcIP == "" {
 		return nil
 	}
@@ -111,6 +123,9 @@ func (d *Detector) Ingest(ev Event) []schema.Finding {
 
 	sw, ok := d.sources[ev.SrcIP]
 	if !ok {
+		if len(d.sources) >= d.cfg.MaxTrackedSources {
+			d.evictCapacityLocked(ts)
+		}
 		sw = &sourceWindow{}
 		d.sources[ev.SrcIP] = sw
 	}
@@ -126,6 +141,9 @@ func (d *Detector) Ingest(ev Event) []schema.Finding {
 
 	sw.events = append(sw.events, ev)
 	sw.events = pruneEvents(sw.events, cutoff)
+	if len(sw.events) > d.cfg.MaxEventsPerSource {
+		sw.events = sw.events[len(sw.events)-d.cfg.MaxEventsPerSource:]
+	}
 
 	var findings []schema.Finding
 
@@ -140,6 +158,49 @@ func (d *Detector) Ingest(ev Event) []schema.Finding {
 	}
 
 	return findings
+}
+
+func (d *Detector) evictCapacityLocked(now time.Time) {
+	for ip, sw := range d.sources {
+		if now.Sub(sw.latest) > d.cfg.Window {
+			delete(d.sources, ip)
+		}
+	}
+	if d.cfg.Cooldown > 0 {
+		for k, prev := range d.lastAlert {
+			if now.Sub(prev) > d.cfg.Cooldown {
+				delete(d.lastAlert, k)
+			}
+		}
+	}
+	for len(d.sources) >= d.cfg.MaxTrackedSources {
+		var oldestIP string
+		var oldestTime time.Time
+		first := true
+		for ip, sw := range d.sources {
+			if first || sw.latest.Before(oldestTime) {
+				oldestIP = ip
+				oldestTime = sw.latest
+				first = false
+			}
+		}
+		if !first {
+			delete(d.sources, oldestIP)
+		} else {
+			break
+		}
+	}
+}
+
+func canonicalIPString(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	if ip := net.ParseIP(trimmed); ip != nil {
+		return ip.String()
+	}
+	return trimmed
 }
 
 func (d *Detector) checkVerticalScan(latest Event, events []Event) (schema.Finding, bool) {

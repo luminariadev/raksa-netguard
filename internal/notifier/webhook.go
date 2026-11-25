@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -32,9 +33,19 @@ type WebhookSink struct {
 
 // NewWebhookSink validates cfg and builds a WebhookSink with bounded request timeouts.
 func NewWebhookSink(cfg WebhookConfig) (*WebhookSink, error) {
-	if strings.TrimSpace(cfg.URL) == "" {
+	rawURL := strings.TrimSpace(cfg.URL)
+	if rawURL == "" {
 		return nil, errors.New("webhook URL must not be empty")
 	}
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid webhook URL: %w", err)
+	}
+	scheme := strings.ToLower(parsedURL.Scheme)
+	if (scheme != "http" && scheme != "https") || parsedURL.Host == "" {
+		return nil, fmt.Errorf("webhook URL must use http or https with a valid host")
+	}
+	cfg.URL = parsedURL.String()
 	fmtName := strings.ToLower(strings.TrimSpace(cfg.Format))
 	if fmtName == "" {
 		fmtName = "generic"

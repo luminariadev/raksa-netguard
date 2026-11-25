@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"regexp"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -12,6 +13,8 @@ import (
 )
 
 const sarifSchemaURL = "https://json.schemastore.org/sarif-2.1.0.json"
+
+var ansiEscapePattern = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
 
 // WriteReport serializes rep in the requested format ("table", "json", or "sarif").
 func WriteReport(w io.Writer, rep schema.Report, format string) error {
@@ -47,9 +50,9 @@ func FormatTable(w io.Writer, rep schema.Report) error {
 	for _, f := range rep.Findings {
 		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n",
 			strings.ToUpper(string(f.Severity)),
-			f.RuleID,
-			f.Target,
-			f.Title,
+			sanitizeTerminalText(f.RuleID),
+			sanitizeTerminalText(f.Target),
+			sanitizeTerminalText(f.Title),
 		); err != nil {
 			return err
 		}
@@ -225,4 +228,21 @@ func sarifURI(target string) string {
 		return "network/host"
 	}
 	return t
+}
+
+func sanitizeTerminalText(s string) string {
+	cleaned := ansiEscapePattern.ReplaceAllString(s, "")
+	var b strings.Builder
+	b.Grow(len(cleaned))
+	for _, r := range cleaned {
+		switch {
+		case r == '\t' || r == '\n' || r == '\r':
+			b.WriteByte(' ')
+		case r < 0x20 || r == 0x7f:
+			continue
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
