@@ -1,0 +1,73 @@
+# Example Host Network Baseline Policy for raksa-netguard
+# Copy and tailor this file per server role (web, api, db, bastions).
+
+version: "1.0"
+host_role: "web-api-node"
+
+# Default allowed listening ports on this host.
+allowed_ports:
+  - port: 22
+    protocol: tcp
+    service: openssh
+    allowed_binds:
+      - "10.0.0.10"
+    allow_public: false
+    reason: "SSH restricted to private management interface"
+
+  - port: 80
+    protocol: tcp
+    service: nginx-redirect
+    allowed_binds:
+      - "0.0.0.0"
+      - "::"
+    allow_public: true
+    reason: "Public HTTP entrypoint redirecting to HTTPS"
+
+  - port: 443
+    protocol: tcp
+    service: nginx-tls
+    allowed_binds:
+      - "0.0.0.0"
+      - "::"
+    allow_public: true
+    reason: "Public HTTPS ingress"
+
+  - port: 5432
+    protocol: tcp
+    service: postgresql
+    allowed_binds:
+      - "127.0.0.1"
+      - "::1"
+    allow_public: false
+    reason: "Database bound strictly to loopback for local sidecar access"
+
+  - port: 8080
+    protocol: tcp
+    service: app-http
+    allowed_binds:
+      - "127.0.0.1"
+    allow_public: false
+    reason: "Application server fronted by reverse proxy"
+
+# Explicitly prohibited ports (triggers high/critical drift finding if active).
+forbidden_ports:
+  - port: 23
+    protocol: tcp
+    reason: "Cleartext Telnet protocol prohibited across all environments"
+
+  - port: 21
+    protocol: tcp
+    reason: "Unencrypted FTP prohibited; use SFTP/SSH"
+
+  - port: 6379
+    protocol: tcp
+    reason: "Redis must not run directly on public API nodes"
+
+# Optional defaults for log-based scan detection.
+detector:
+  window: "60s"
+  vertical_port_threshold: 10
+  horizontal_host_threshold: 8
+  burst_threshold: 25
+  cooldown: "5m"
+  ignore_private: true
