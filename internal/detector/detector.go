@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
-	"net"
+	"net/netip"
 	"sort"
 	"strings"
 	"sync"
@@ -95,9 +95,181 @@ type alertKey struct {
 	ruleID string
 }
 
-type sourceWindow struct {
+type windowHolder interface {
+	latestTime() time.Time
+}
+
+// eventRing maintains events ordered by timestamp with amortized O(1) head eviction.
+type eventRing struct {
 	latest time.Time
 	events []Event
+	head   int
+}
+
+func (r *eventRing) latestTime() time.Time {
+	return r.latest
+}
+
+func (r *eventRing) activeLen() int {
+	return len(r.events) - r.head
+}
+
+func (r *eventRing) insertSorted(ev Event) {
+	n := len(r.events)
+	if n == r.head || !ev.Timestamp.Before(r.events[n-1].Timestamp) {
+		r.events = append(r.events, ev)
+		return
+	}
+	r.events = append(r.events, ev)
+	i := n
+	for i > r.head && ev.Timestamp.Before(r.events[i-1].Timestamp) {
+		r.events[i] = r.events[i-1]
+		i--
+	}
+	r.events[i] = ev
+}
+
+func (r *eventRing) evict(cutoff time.Time, maxEvents int, onEvict func(Event)) {
+	for r.head < len(r.events) && r.events[r.head].Timestamp.Before(cutoff) {
+		if onEvict != nil {
+			onEvict(r.events[r.head])
+		}
+		r.head++
+	}
+	for len(r.events)-r.head > maxEvents {
+		if onEvict != nil {
+			onEvict(r.events[r.head])
+		}
+		r.head++
+	}
+	if r.head > 64 && r.head*2 >= len(r.events) {
+		remaining := copy(r.events, r.events[r.head:])
+		r.events = r.events[:remaining]
+		r.head = 0
+	}
+}
+
+type sourceWindow struct {
+	eventRing
+	dstPortCounts  map[string]map[int]int
+	portHostCounts map[int]map[string]int
+}
+
+func newSourceWindow() *sourceWindow {
+	return &sourceWindow{
+		dstPortCounts:  make(map[string]map[int]int),
+		portHostCounts: make(map[int]map[string]int),
+	}
+}
+
+func (sw *sourceWindow) add(ev Event, window time.Duration, maxEvents int) bool {
+	if ev.Timestamp.After(sw.latest) {
+		sw.latest = ev.Timestamp
+	}
+	cutoff := sw.latest.Add(-window)
+	if ev.Timestamp.Before(cutoff) {
+		return false
+	}
+
+	sw.insertSorted(ev)
+	sw.incrementCounts(ev)
+	sw.evict(cutoff, maxEvents, sw.decrementCounts)
+	return true
+}
+
+func (sw *sourceWindow) incrementCounts(ev Event) {
+	if ev.DstPort <= 0 || ev.DstIP == "" {
+		return
+	}
+	ports := sw.dstPortCounts[ev.DstIP]
+	if ports == nil {
+		ports = make(map[int]int)
+		sw.dstPortCounts[ev.DstIP] = ports
+	}
+	ports[ev.DstPort]++
+
+	hosts := sw.portHostCounts[ev.DstPort]
+	if hosts == nil {
+		hosts = make(map[string]int)
+		sw.portHostCounts[ev.DstPort] = hosts
+	}
+	hosts[ev.DstIP]++
+}
+
+func (sw *sourceWindow) decrementCounts(ev Event) {
+	if ev.DstPort <= 0 || ev.DstIP == "" {
+		return
+	}
+	if ports := sw.dstPortCounts[ev.DstIP]; ports != nil {
+		if count := ports[ev.DstPort]; count <= 1 {
+			delete(ports, ev.DstPort)
+			if len(ports) == 0 {
+				delete(sw.dstPortCounts, ev.DstIP)
+			}
+		} else {
+			ports[ev.DstPort] = count - 1
+		}
+	}
+	if hosts := sw.portHostCounts[ev.DstPort]; hosts != nil {
+		if count := hosts[ev.DstIP]; count <= 1 {
+			delete(hosts, ev.DstIP)
+			if len(hosts) == 0 {
+				delete(sw.portHostCounts, ev.DstPort)
+			}
+		} else {
+			hosts[ev.DstIP] = count - 1
+		}
+	}
+}
+
+type targetWindow struct {
+	eventRing
+	srcCounts  map[string]int
+	portCounts map[int]int
+}
+
+func newTargetWindow() *targetWindow {
+	return &targetWindow{
+		srcCounts:  make(map[string]int),
+		portCounts: make(map[int]int),
+	}
+}
+
+func (tw *targetWindow) add(ev Event, window time.Duration, maxEvents int) bool {
+	if ev.Timestamp.After(tw.latest) {
+		tw.latest = ev.Timestamp
+	}
+	cutoff := tw.latest.Add(-window)
+	if ev.Timestamp.Before(cutoff) {
+		return false
+	}
+
+	tw.insertSorted(ev)
+	if ev.SrcIP != "" {
+		tw.srcCounts[ev.SrcIP]++
+	}
+	if ev.DstPort > 0 {
+		tw.portCounts[ev.DstPort]++
+	}
+	tw.evict(cutoff, maxEvents, tw.decrementCounts)
+	return true
+}
+
+func (tw *targetWindow) decrementCounts(ev Event) {
+	if ev.SrcIP != "" {
+		if c := tw.srcCounts[ev.SrcIP]; c <= 1 {
+			delete(tw.srcCounts, ev.SrcIP)
+		} else {
+			tw.srcCounts[ev.SrcIP] = c - 1
+		}
+	}
+	if ev.DstPort > 0 {
+		if c := tw.portCounts[ev.DstPort]; c <= 1 {
+			delete(tw.portCounts, ev.DstPort)
+		} else {
+			tw.portCounts[ev.DstPort] = c - 1
+		}
+	}
 }
 
 // Detector tracks per-source and per-target network telemetry over bounded sliding windows.
@@ -105,7 +277,7 @@ type Detector struct {
 	cfg       Config
 	mu        sync.Mutex
 	sources   map[string]*sourceWindow
-	targets   map[string]*sourceWindow
+	targets   map[string]*targetWindow
 	lastAlert map[alertKey]time.Time
 }
 
@@ -114,7 +286,7 @@ func New(cfg Config) *Detector {
 	return &Detector{
 		cfg:       cfg.withDefaults(),
 		sources:   make(map[string]*sourceWindow),
-		targets:   make(map[string]*sourceWindow),
+		targets:   make(map[string]*targetWindow),
 		lastAlert: make(map[alertKey]time.Time),
 	}
 }
@@ -138,26 +310,45 @@ func (d *Detector) Ingest(ev Event) []schema.Finding {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	sw := d.appendWindowEventLocked(d.sources, ev.SrcIP, ev, ts, d.cfg.MaxTrackedSources)
-	var tw *sourceWindow
+	sw, ok := d.sources[ev.SrcIP]
+	if !ok {
+		if len(d.sources) >= d.cfg.MaxTrackedSources {
+			evictWindowMapLocked(d.sources, d.cfg.MaxTrackedSources, d.cfg.Window, d.cfg.Cooldown, d.lastAlert, ts)
+		}
+		sw = newSourceWindow()
+		d.sources[ev.SrcIP] = sw
+	}
+	srcActive := sw.add(ev, d.cfg.Window, d.cfg.MaxEventsPerSource)
+
+	var tw *targetWindow
+	tgtActive := false
 	if ev.DstIP != "" && ev.DstPort > 0 {
-		tw = d.appendWindowEventLocked(d.targets, ev.DstIP, ev, ts, d.cfg.MaxTrackedTargets)
+		var tok bool
+		tw, tok = d.targets[ev.DstIP]
+		if !tok {
+			if len(d.targets) >= d.cfg.MaxTrackedTargets {
+				evictWindowMapLocked(d.targets, d.cfg.MaxTrackedTargets, d.cfg.Window, d.cfg.Cooldown, d.lastAlert, ts)
+			}
+			tw = newTargetWindow()
+			d.targets[ev.DstIP] = tw
+		}
+		tgtActive = tw.add(ev, d.cfg.Window, d.cfg.MaxEventsPerSource)
 	}
 
 	var findings []schema.Finding
-	if sw != nil {
-		if f, triggered := d.checkVerticalScan(ev, sw.events); triggered {
+	if srcActive {
+		if f, triggered := d.checkVerticalScan(ev, sw); triggered {
 			findings = append(findings, f)
 		}
-		if f, triggered := d.checkHorizontalScan(ev, sw.events); triggered {
+		if f, triggered := d.checkHorizontalScan(ev, sw); triggered {
 			findings = append(findings, f)
 		}
-		if f, triggered := d.checkBurst(ev, sw.events); triggered {
+		if f, triggered := d.checkBurst(ev, sw); triggered {
 			findings = append(findings, f)
 		}
 	}
-	if tw != nil {
-		if f, triggered := d.checkDistributedScan(ev, tw.events); triggered {
+	if tgtActive {
+		if f, triggered := d.checkDistributedScan(ev, tw); triggered {
 			findings = append(findings, f)
 		}
 	}
@@ -165,43 +356,16 @@ func (d *Detector) Ingest(ev Event) []schema.Finding {
 	return findings
 }
 
-func (d *Detector) appendWindowEventLocked(store map[string]*sourceWindow, key string, ev Event, ts time.Time, maxTracked int) *sourceWindow {
-	w, ok := store[key]
-	if !ok {
-		if len(store) >= maxTracked {
-			d.evictWindowMapLocked(store, maxTracked, ts)
-		}
-		w = &sourceWindow{}
-		store[key] = w
-	}
-
-	if ts.After(w.latest) {
-		w.latest = ts
-	}
-	cutoff := w.latest.Add(-d.cfg.Window)
-	if ts.Before(cutoff) {
-		// Drop events older than the active sliding window.
-		return nil
-	}
-
-	w.events = append(w.events, ev)
-	w.events = pruneEvents(w.events, cutoff)
-	if len(w.events) > d.cfg.MaxEventsPerSource {
-		w.events = w.events[len(w.events)-d.cfg.MaxEventsPerSource:]
-	}
-	return w
-}
-
-func (d *Detector) evictWindowMapLocked(store map[string]*sourceWindow, maxTracked int, now time.Time) {
-	for k, sw := range store {
-		if now.Sub(sw.latest) > d.cfg.Window {
+func evictWindowMapLocked[W windowHolder](store map[string]W, maxTracked int, window, cooldown time.Duration, lastAlert map[alertKey]time.Time, now time.Time) {
+	for k, w := range store {
+		if now.Sub(w.latestTime()) > window {
 			delete(store, k)
 		}
 	}
-	if d.cfg.Cooldown > 0 {
-		for k, prev := range d.lastAlert {
-			if now.Sub(prev) > d.cfg.Cooldown {
-				delete(d.lastAlert, k)
+	if cooldown > 0 {
+		for k, prev := range lastAlert {
+			if now.Sub(prev) > cooldown {
+				delete(lastAlert, k)
 			}
 		}
 	}
@@ -209,10 +373,11 @@ func (d *Detector) evictWindowMapLocked(store map[string]*sourceWindow, maxTrack
 		var oldestKey string
 		var oldestTime time.Time
 		first := true
-		for k, sw := range store {
-			if first || sw.latest.Before(oldestTime) {
+		for k, w := range store {
+			wt := w.latestTime()
+			if first || wt.Before(oldestTime) {
 				oldestKey = k
-				oldestTime = sw.latest
+				oldestTime = wt
 				first = false
 			}
 		}
@@ -229,48 +394,25 @@ func canonicalIPString(raw string) string {
 	if trimmed == "" {
 		return ""
 	}
-	if ip := net.ParseIP(trimmed); ip != nil {
-		return ip.String()
+	if addr, err := netip.ParseAddr(trimmed); err == nil {
+		return addr.Unmap().String()
 	}
 	return trimmed
 }
 
-func (d *Detector) checkVerticalScan(latest Event, events []Event) (schema.Finding, bool) {
+func (d *Detector) checkVerticalScan(latest Event, sw *sourceWindow) (schema.Finding, bool) {
 	if latest.DstPort <= 0 || latest.DstIP == "" {
 		return schema.Finding{}, false
 	}
-
-	portsByDst := make(map[string]map[int]struct{})
-	for _, e := range events {
-		if e.DstPort <= 0 || e.DstIP == "" {
-			continue
-		}
-		set, ok := portsByDst[e.DstIP]
-		if !ok {
-			set = make(map[int]struct{})
-			portsByDst[e.DstIP] = set
-		}
-		set[e.DstPort] = struct{}{}
-	}
-
-	var matchedDst string
-	var uniquePorts []int
-	for dstIP, portSet := range portsByDst {
-		if len(portSet) >= d.cfg.VerticalPortThreshold {
-			if len(portSet) > len(uniquePorts) {
-				matchedDst = dstIP
-				uniquePorts = mapKeysSorted(portSet)
-			}
-		}
-	}
-
-	if matchedDst == "" {
+	portSet := sw.dstPortCounts[latest.DstIP]
+	if len(portSet) < d.cfg.VerticalPortThreshold {
 		return schema.Finding{}, false
 	}
 	if !d.canEmit(latest.SrcIP, "NET-101", latest.Timestamp) {
 		return schema.Finding{}, false
 	}
 
+	uniquePorts := intMapKeysSorted(portSet)
 	sample := uniquePorts
 	if len(sample) > 15 {
 		sample = sample[:15]
@@ -283,11 +425,11 @@ func (d *Detector) checkVerticalScan(latest Event, events []Event) (schema.Findi
 		Layer:       schema.LayerNetwork,
 		Severity:    schema.SeverityHigh,
 		Title:       "Vertical port scan detected",
-		Description: fmt.Sprintf("Source %s probed %d distinct destination ports on %s within %s.", latest.SrcIP, len(uniquePorts), matchedDst, d.cfg.Window),
-		Target:      fmt.Sprintf("ip://%s->%s", latest.SrcIP, matchedDst),
+		Description: fmt.Sprintf("Source %s probed %d distinct destination ports on %s within %s.", latest.SrcIP, len(uniquePorts), latest.DstIP, d.cfg.Window),
+		Target:      fmt.Sprintf("ip://%s->%s", latest.SrcIP, latest.DstIP),
 		Evidence: map[string]any{
 			"src_ip":       latest.SrcIP,
-			"dst_ip":       matchedDst,
+			"dst_ip":       latest.DstIP,
 			"unique_ports": len(uniquePorts),
 			"sample_ports": sample,
 			"window":       d.cfg.Window.String(),
@@ -298,42 +440,19 @@ func (d *Detector) checkVerticalScan(latest Event, events []Event) (schema.Findi
 	}, true
 }
 
-func (d *Detector) checkHorizontalScan(latest Event, events []Event) (schema.Finding, bool) {
+func (d *Detector) checkHorizontalScan(latest Event, sw *sourceWindow) (schema.Finding, bool) {
 	if latest.DstPort <= 0 {
 		return schema.Finding{}, false
 	}
-
-	hostsByPort := make(map[int]map[string]struct{})
-	for _, e := range events {
-		if e.DstPort <= 0 || e.DstIP == "" {
-			continue
-		}
-		set, ok := hostsByPort[e.DstPort]
-		if !ok {
-			set = make(map[string]struct{})
-			hostsByPort[e.DstPort] = set
-		}
-		set[e.DstIP] = struct{}{}
-	}
-
-	var matchedPort int
-	var uniqueHosts []string
-	for port, hostSet := range hostsByPort {
-		if len(hostSet) >= d.cfg.HorizontalHostThreshold {
-			if len(hostSet) > len(uniqueHosts) {
-				matchedPort = port
-				uniqueHosts = stringKeysSorted(hostSet)
-			}
-		}
-	}
-
-	if matchedPort == 0 {
+	hostSet := sw.portHostCounts[latest.DstPort]
+	if len(hostSet) < d.cfg.HorizontalHostThreshold {
 		return schema.Finding{}, false
 	}
 	if !d.canEmit(latest.SrcIP, "NET-102", latest.Timestamp) {
 		return schema.Finding{}, false
 	}
 
+	uniqueHosts := stringMapKeysSorted(hostSet)
 	sample := uniqueHosts
 	if len(sample) > 10 {
 		sample = sample[:10]
@@ -346,23 +465,24 @@ func (d *Detector) checkHorizontalScan(latest Event, events []Event) (schema.Fin
 		Layer:       schema.LayerNetwork,
 		Severity:    schema.SeverityHigh,
 		Title:       "Horizontal network scan detected",
-		Description: fmt.Sprintf("Source %s swept port %d across %d distinct destination hosts within %s.", latest.SrcIP, matchedPort, len(uniqueHosts), d.cfg.Window),
-		Target:      fmt.Sprintf("ip://%s->*:%d", latest.SrcIP, matchedPort),
+		Description: fmt.Sprintf("Source %s swept port %d across %d distinct destination hosts within %s.", latest.SrcIP, latest.DstPort, len(uniqueHosts), d.cfg.Window),
+		Target:      fmt.Sprintf("ip://%s->*:%d", latest.SrcIP, latest.DstPort),
 		Evidence: map[string]any{
 			"src_ip":       latest.SrcIP,
-			"dst_port":     matchedPort,
+			"dst_port":     latest.DstPort,
 			"unique_hosts": len(uniqueHosts),
 			"sample_hosts": sample,
 			"window":       d.cfg.Window.String(),
 		},
-		Remediation: fmt.Sprintf("Review network ingress logs for %s and enforce perimeter ACLs on port %d.", latest.SrcIP, matchedPort),
+		Remediation: fmt.Sprintf("Review network ingress logs for %s and enforce perimeter ACLs on port %d.", latest.SrcIP, latest.DstPort),
 		MitreD3FEND: "D3-NTA",
 		Timestamp:   latest.Timestamp,
 	}, true
 }
 
-func (d *Detector) checkBurst(latest Event, events []Event) (schema.Finding, bool) {
-	if len(events) < d.cfg.BurstThreshold {
+func (d *Detector) checkBurst(latest Event, sw *sourceWindow) (schema.Finding, bool) {
+	count := sw.activeLen()
+	if count < d.cfg.BurstThreshold {
 		return schema.Finding{}, false
 	}
 	if !d.canEmit(latest.SrcIP, "NET-103", latest.Timestamp) {
@@ -376,11 +496,11 @@ func (d *Detector) checkBurst(latest Event, events []Event) (schema.Finding, boo
 		Layer:       schema.LayerNetwork,
 		Severity:    schema.SeverityMedium,
 		Title:       "Connection burst anomaly detected",
-		Description: fmt.Sprintf("Source %s generated %d logged connection attempts within %s (threshold: %d).", latest.SrcIP, len(events), d.cfg.Window, d.cfg.BurstThreshold),
+		Description: fmt.Sprintf("Source %s generated %d logged connection attempts within %s (threshold: %d).", latest.SrcIP, count, d.cfg.Window, d.cfg.BurstThreshold),
 		Target:      fmt.Sprintf("ip://%s", latest.SrcIP),
 		Evidence: map[string]any{
 			"src_ip":      latest.SrcIP,
-			"event_count": len(events),
+			"event_count": count,
 			"threshold":   d.cfg.BurstThreshold,
 			"window":      d.cfg.Window.String(),
 		},
@@ -390,35 +510,23 @@ func (d *Detector) checkBurst(latest Event, events []Event) (schema.Finding, boo
 	}, true
 }
 
-func (d *Detector) checkDistributedScan(latest Event, events []Event) (schema.Finding, bool) {
+func (d *Detector) checkDistributedScan(latest Event, tw *targetWindow) (schema.Finding, bool) {
 	if latest.DstIP == "" || latest.DstPort <= 0 {
 		return schema.Finding{}, false
 	}
-
-	srcSet := make(map[string]struct{})
-	portSet := make(map[int]struct{})
-	for _, e := range events {
-		if e.SrcIP != "" {
-			srcSet[e.SrcIP] = struct{}{}
-		}
-		if e.DstPort > 0 {
-			portSet[e.DstPort] = struct{}{}
-		}
-	}
-
-	if len(srcSet) < d.cfg.DistributedSourceThreshold || len(portSet) < d.cfg.DistributedPortThreshold {
+	if len(tw.srcCounts) < d.cfg.DistributedSourceThreshold || len(tw.portCounts) < d.cfg.DistributedPortThreshold {
 		return schema.Finding{}, false
 	}
 	if !d.canEmit("dst:"+latest.DstIP, "NET-104", latest.Timestamp) {
 		return schema.Finding{}, false
 	}
 
-	uniqueSources := stringKeysSorted(srcSet)
+	uniqueSources := stringMapKeysSorted(tw.srcCounts)
 	sampleSources := uniqueSources
 	if len(sampleSources) > 10 {
 		sampleSources = sampleSources[:10]
 	}
-	uniquePorts := mapKeysSorted(portSet)
+	uniquePorts := intMapKeysSorted(tw.portCounts)
 	samplePorts := uniquePorts
 	if len(samplePorts) > 15 {
 		samplePorts = samplePorts[:15]
@@ -463,10 +571,8 @@ func (d *Detector) AnalyzeReader(r io.Reader, format string) ([]schema.Finding, 
 	if normFmt == "" {
 		normFmt = "auto"
 	}
-	switch normFmt {
-	case "auto", "ufw", "iptables", "jsonl":
-	default:
-		return nil, Stats{}, fmt.Errorf("unsupported log format %q: expected auto, ufw, iptables, or jsonl", format)
+	if !IsSupportedLogFormat(normFmt) {
+		return nil, Stats{}, fmt.Errorf("unsupported log format %q: expected auto, ufw, iptables, nftables, windows-fw, or jsonl", format)
 	}
 
 	scanner := bufio.NewScanner(r)
@@ -497,25 +603,26 @@ func (d *Detector) AnalyzeReader(r io.Reader, format string) ([]schema.Finding, 
 	return findings, stats, nil
 }
 
-func pruneEvents(events []Event, cutoff time.Time) []Event {
-	kept := events[:0]
-	for _, e := range events {
-		if !e.Timestamp.Before(cutoff) {
-			kept = append(kept, e)
-		}
+// IsSupportedLogFormat reports whether format is accepted by ParseLine and AnalyzeReader.
+func IsSupportedLogFormat(format string) bool {
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "", "auto", "ufw", "iptables", "nftables", "windows-fw", "pfirewall", "jsonl":
+		return true
+	default:
+		return false
 	}
-	return kept
 }
 
 func isPrivateOrLoopbackIP(raw string) bool {
-	ip := net.ParseIP(raw)
-	if ip == nil {
+	addr, err := netip.ParseAddr(raw)
+	if err != nil {
 		return false
 	}
-	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
+	addr = addr.Unmap()
+	return addr.IsLoopback() || addr.IsPrivate() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast()
 }
 
-func mapKeysSorted(m map[int]struct{}) []int {
+func intMapKeysSorted(m map[int]int) []int {
 	keys := make([]int, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)
@@ -524,7 +631,7 @@ func mapKeysSorted(m map[int]struct{}) []int {
 	return keys
 }
 
-func stringKeysSorted(m map[string]struct{}) []string {
+func stringMapKeysSorted(m map[string]int) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)
