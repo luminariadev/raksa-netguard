@@ -313,6 +313,39 @@ func TestAudit(t *testing.T) {
 	})
 }
 
+func TestWildcardAndPolicySizeHardening(t *testing.T) {
+	for _, addr := range []string{"0.0.0.0", "::", "::0", "0:0:0:0:0:0:0:0", "::ffff:0.0.0.0", "*"} {
+		if !IsWildcardBind(addr) {
+			t.Fatalf("expected %q to be treated as wildcard bind", addr)
+		}
+	}
+	if IsWildcardBind("127.0.0.1") || IsWildcardBind("::1") {
+		t.Fatal("loopback address must not be treated as wildcard")
+	}
+
+	p := &Policy{
+		Version: "1.0",
+		AllowedPorts: []PortRule{
+			{Port: 5432, Protocol: "tcp", Service: "postgresql", AllowedBinds: []string{"127.0.0.1"}},
+		},
+	}
+	// IPv4-mapped IPv6 loopback normalizes to 127.0.0.1 and matches the rule cleanly.
+	findings := Audit([]Listener{
+		{Protocol: "tcp", BindAddr: normalizeBindAddr("::ffff:127.0.0.1"), Port: 5432, State: "LISTENING"},
+	}, p, time.Now().UTC())
+	if len(findings) != 0 {
+		t.Fatalf("expected IPv4-mapped loopback to match 127.0.0.1, got %+v", findings)
+	}
+
+	// Oversized YAML (> 1 MiB) is rejected safely.
+	oversizedPath := filepath.Join(t.TempDir(), "oversized.yaml")
+	big := "version: \"1.0\"\n# " + strings.Repeat("A", maxPolicyBytes+128) + "\n"
+	writeTempPolicy(t, oversizedPath, big)
+	if _, err := LoadPolicy(oversizedPath); err == nil || !strings.Contains(err.Error(), "exceeds maximum size") {
+		t.Fatalf("expected oversized policy error, got %v", err)
+	}
+}
+
 func writeTempPolicy(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {

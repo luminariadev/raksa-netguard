@@ -120,4 +120,33 @@ func TestFormatters(t *testing.T) {
 			t.Fatal("expected error for unsupported format")
 		}
 	})
+
+	t.Run("sanitizes ANSI escapes and control characters in table output", func(t *testing.T) {
+		var buf bytes.Buffer
+		dirty := []schema.Finding{
+			{
+				ID:          "net-101-test",
+				RuleID:      "NET-101\x1b[31m",
+				Module:      "scan-detector",
+				Layer:       schema.LayerNetwork,
+				Severity:    schema.SeverityHigh,
+				Title:       "Title\nInjected\x07Row",
+				Description: "Test",
+				Target:      "ip://198.51.100.1\x1b[2J",
+				Remediation: "Block",
+				MitreD3FEND: "D3-NTA",
+				Timestamp:   now,
+			},
+		}
+		if err := WriteReport(&buf, schema.NewReport(dirty, now), "table"); err != nil {
+			t.Fatalf("WriteReport dirty table: %v", err)
+		}
+		out := buf.String()
+		if strings.Contains(out, "\x1b") || strings.Contains(out, "\x07") {
+			t.Fatalf("table output leaked ANSI/control bytes: %q", out)
+		}
+		if !strings.Contains(out, "Title InjectedRow") {
+			t.Fatalf("expected sanitized whitespace replacement, got: %q", out)
+		}
+	})
 }

@@ -160,5 +160,10 @@ func TestWebhookSink_RetriesAndErrors(t *testing.T) {
 		if _, err := NewWebhookSink(WebhookConfig{URL: "https://example.invalid", Format: "teams"}); err == nil {
 			t.Fatal("expected error for unsupported webhook format")
 		}
+		for _, badURL := range []string{"file:///etc/passwd", "ftp://example.com/hook", "https:///missing-host", "javascript:alert(1)"} {
+			if _, err := NewWebhookSink(WebhookConfig{URL: badURL}); err == nil {
+				t.Fatalf("expected rejection for invalid webhook URL %q", badURL)
+			}
+		}
 	})
 }
