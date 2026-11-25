@@ -1,14 +1,27 @@
 # raksa-netguard
 
-`raksa-netguard` is a lightweight, strictly defensive Go CLI for verifying host network posture and detecting reconnaissance patterns in local firewall or flow logs. It is Layer 1 (Network Defense) of the **Raksa** modular Blue Team and DevSecOps suite.
+[![CI](https://github.com/luminariadev/raksa-netguard/actions/workflows/ci.yml/badge.svg)](https://github.com/luminariadev/raksa-netguard/actions/workflows/ci.yml)
+[![Go Version](https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go&logoColor=white)](https://go.dev/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-## Why raksa-netguard
+`raksa-netguard` is a lightweight, strictly defensive Go CLI for auditing local host listening sockets against a declarative security baseline and detecting reconnaissance patterns in firewall or flow logs. It is Layer 1 (Network Defense) of the **Raksa** modular Blue Team and DevSecOps suite.
 
-Servers regularly drift from their intended network surface—a database accidentally binds to `0.0.0.0`, an unapproved service starts listening, or external hosts sweep ports against perimeter firewalls. `raksa-netguard` addresses both sides without external agents or active network probing:
+## Overview
 
-1. **Host Open-Port Baseline Auditing (`audit`, `policy-check`)**: Inspects locally bound sockets (`/proc/net/*` on Linux, `netstat -ano` on Windows) against a declarative YAML baseline policy and flags drift, forbidden ports, or unsafe wildcard binds.
-2. **Firewall & Flow Log Scan Detection (`analyze`, `watch`)**: Parses UFW, iptables, or JSONL flow logs through a thread-safe sliding-window tracker to flag vertical port scans, horizontal host sweeps, and connection bursts with cooldown deduplication.
-3. **CI/CD & SIEM Integration**: Outputs human-readable tables, **Raksa Finding Schema v1** JSON, or **SARIF 2.1.0** for GitHub Code Scanning, and enforces `--fail-on <severity>` exit codes (`2` on breach).
+Servers routinely drift from their intended network surface—a database binds to `0.0.0.0`, a legacy daemon opens an unapproved port, or external scanners sweep edge firewalls. `raksa-netguard` addresses both surfaces without background agents or active network probing:
+
+1. **Host Open-Port Baseline Auditing (`audit`, `policy-check`)** — Reads locally bound TCP/UDP sockets (`/proc/net/*` on Linux, `netstat -ano` on Windows) and checks them against a version-controlled YAML baseline policy.
+2. **Firewall & Flow Log Scan Detection (`analyze`, `watch`)** — Streams UFW, iptables, or JSONL flow records through a thread-safe sliding-window tracker to detect vertical port scans, horizontal sweeps, and connection bursts with per-rule cooldown deduplication.
+3. **CI/CD & SIEM Integration** — Emits human-readable tables, **Raksa Finding Schema v1** JSON, or **SARIF 2.1.0** for GitHub Code Scanning, with `--fail-on <severity>` exit codes (`2` on policy or detection breach).
+
+## Hardening & Scope Boundaries
+
+`raksa-netguard` is engineered to handle untrusted inputs safely while remaining transparent about its operational boundary:
+
+- **Bounded-Memory Flood Protection**: Sliding-window state caps tracked source IPs (`MaxTrackedSources`, default `10,000`) and per-source buffers (`MaxEventsPerSource`, default `1,000`), evicting stale or oldest windows so spoofed-IP log floods cannot trigger unbounded memory growth.
+- **IPv4 / IPv6 Canonicalization**: Normalizes IPv4-mapped IPv6 addresses (`::ffff:198.51.100.42`) and expanded wildcard notations (`0:0:0:0:0:0:0:0`, `::ffff:0.0.0.0`) so split-notation traffic cannot evade thresholds or bind checks.
+- **Parser & Output Safety**: Enforces a 1 MiB YAML baseline limit, rejects unknown policy fields, strips ANSI escape sequences and control characters from terminal table rendering, and restricts webhook sinks to `http`/`https` endpoints.
+- **Explicit Scope Boundary**: `raksa-netguard` is a passive host auditor and log-telemetry analyzer. It does not perform inline packet filtering (`nftables`/`ufw`), volumetric DDoS mitigation, or deep packet inspection.
 
 ## Architecture
 
@@ -24,7 +37,7 @@ Servers regularly drift from their intended network surface—a database acciden
             |                                      v
             v                           +---------------------+
  +---------------------+                |  detector.Detector  |
- |  baseline.Auditor   | <-- YAML -->   |  (Sliding Window +  |
+ |  baseline.Auditor   | <-- YAML -->   |  (Bounded Window +  |
  |  (NET-001..NET-004) |    Policy      |  Cooldown Tracker)  |
  +---------------------+                +---------------------+
             |                                      |
@@ -42,7 +55,7 @@ Servers regularly drift from their intended network surface—a database acciden
       +-----------+      +-----------+       +-------------+
 ```
 
-Detailed design notes and defensive boundaries live in [docs/architecture.md](docs/architecture.md) and [docs/threat-model.md](docs/threat-model.md).
+See [docs/architecture.md](docs/architecture.md) and [docs/threat-model.md](docs/threat-model.md) for package design details and threat assumptions.
 
 ## Installation
 
@@ -78,7 +91,7 @@ Lint a baseline YAML policy in pull requests before deploying it to hosts:
 raksa-netguard policy-check --policy configs/baseline.example.yaml --fail-on high
 ```
 
-Output on a compliant policy:
+Verified output on the bundled baseline:
 
 ```text
 No findings detected by raksa-netguard.
@@ -106,7 +119,7 @@ HIGH      NET-002  tcp://0.0.0.0:445          Unauthorized listening port detect
 
 ### 3. Analyze firewall or flow logs (`analyze`)
 
-Detect vertical port scans, horizontal sweeps, and connection bursts on UFW/iptables or JSONL logs:
+Detect vertical port scans, horizontal sweeps, and connection bursts across UFW, iptables, or JSONL logs:
 
 ```bash
 raksa-netguard analyze --log testdata/ufw_mixed.log --format table
@@ -171,7 +184,7 @@ raksa-netguard analyze --log testdata/flows_scan.jsonl --format json --fail-on h
 
 ### 4. Tail live firewall logs with webhook alerts (`watch`)
 
-Pass webhook URLs and tokens via environment variables (`RAKSA_WEBHOOK_URL`, `RAKSA_WEBHOOK_TOKEN`) to avoid exposing secrets in process listings:
+Pass webhook URLs and bearer tokens via environment variables (`RAKSA_WEBHOOK_URL`, `RAKSA_WEBHOOK_TOKEN`) to avoid exposing credentials in process listings:
 
 ```bash
 export RAKSA_WEBHOOK_URL="https://hooks.slack.com/services/..."
@@ -243,11 +256,12 @@ go vet ./...
 go test -race -cover ./...
 ```
 
-> Note: On Windows hosts without `gcc`/CGO enabled, run `go test -cover ./...`; `-race` is enforced in Linux CI on every push and pull request.
+> Note: On Windows hosts without `gcc`/CGO enabled, run `go test -count=1 -cover ./...`; `-race` is enforced in Linux CI on every push and pull request.
 
 ## Raksa Security Suite
 
 `raksa-netguard` is Layer 1 of the Raksa Blue Team & DevSecOps suite:
+
 - **Layer 1 (`raksa-netguard`, Go)**: Network & perimeter defense (this repository)
 - **Layer 2 (`raksa-hostguard`, Rust)**: Host integrity monitoring & Linux/Docker CIS auditing
 - **Layer 3 (`raksa-webshield`, TypeScript + Go)**: Anti-XSS sanitization & HTTP security header auditing
