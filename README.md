@@ -10,9 +10,9 @@
 
 Servers routinely drift from their intended network surface: a database binds to `0.0.0.0`, a legacy daemon opens an unapproved port, or external scanners sweep edge firewalls. `raksa-netguard` addresses both surfaces without background agents or active network probing:
 
-1. **Host Open-Port Baseline Auditing (`audit`, `policy-check`)**: Reads locally bound TCP/UDP sockets (`/proc/net/*` on Linux, `netstat -ano` on Windows), enriches findings with owning process names and PIDs, and checks them against a version-controlled YAML baseline policy.
-2. **Firewall & Flow Log Scan Detection (`analyze`, `watch`)**: Streams UFW, iptables, or JSONL flow records through a bounded sliding-window tracker to detect vertical port scans, horizontal sweeps, connection bursts, and distributed multi-source scans with per-rule cooldown deduplication.
-3. **CI/CD & SIEM Integration**: Emits human-readable tables, **Raksa Finding Schema v1** JSON, or **SARIF 2.1.0** for GitHub Code Scanning, with `--fail-on <severity>` exit codes (`2` on policy or detection breach).
+1. **Host Open-Port Baseline Auditing (`init`, `audit`, `policy-check`)**: Generates starter baselines from local sockets (`/proc/net/*` on Linux, `netstat -ano` on Windows), enriches findings with owning process names and PIDs, and validates drift against version-controlled YAML policies.
+2. **Firewall & Flow Log Scan Detection (`analyze`, `watch`)**: Streams UFW, iptables, nftables, Windows Defender Firewall (`pfirewall.log`), or JSONL records through an O(1) amortized sliding-window tracker to detect vertical scans, horizontal sweeps, bursts, and distributed multi-source scans.
+3. **CI/CD, SIEM & Agent Integration (`rules`, `mcp`)**: Emits tables, **Raksa Finding Schema v1** JSON, or **SARIF 2.1.0**, enforces `--fail-on <severity>` exit codes, and includes a built-in `stdio` JSON-RPC MCP server (`raksa-netguard mcp`) for autonomous coding and security agents.
 
 ## Hardening & Scope Boundaries
 
@@ -86,6 +86,15 @@ docker run --rm -v "$(pwd)/configs:/configs:ro" -v "$(pwd)/testdata:/testdata:ro
 ```
 
 ## Quickstart
+
+### 0. Generate a starter baseline and inspect rules (`init`, `rules`)
+
+Bootstrap a YAML baseline directly from your current host sockets and inspect all built-in rules:
+
+```bash
+raksa-netguard init --host-role api-node --out baseline.yaml
+raksa-netguard rules --format table
+```
 
 ### 1. Validate a baseline policy (`policy-check`)
 
@@ -269,11 +278,47 @@ forbidden_ports:
     reason: "Cleartext Telnet prohibited"
 ```
 
+## MCP Server Integration (Agents & Tooling)
+
+`raksa-netguard` exposes its defensive workflows natively over `stdio` JSON-RPC 2.0 via `raksa-netguard mcp`, allowing coding and security agents to inspect host exposure and analyze logs without fragile shell scraping.
+
+Add `raksa-netguard` to any MCP-compatible client configuration:
+
+```json
+{
+  "mcpServers": {
+    "raksa-netguard": {
+      "command": "raksa-netguard",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+Exposed MCP tools:
+- `netguard_list_rules`: Lists all `NET-*` rule IDs, severities, and MITRE D3FEND mappings.
+- `netguard_check_policy`: Validates a baseline file (`policy_path`) or inline YAML (`policy_yaml`).
+- `netguard_audit_host`: Audits active host listening sockets against a policy.
+- `netguard_generate_baseline`: Generates a starter YAML baseline policy with review notes.
+- `netguard_analyze_logs`: Runs sliding-window detection on `log_path` or `log_content` (`auto`, `ufw`, `iptables`, `nftables`, `windows-fw`, `jsonl`).
+
+## Performance & Benchmarks
+
+Measured on Windows/amd64 (Intel Core i5-11400H, Go 1.26.2):
+
+| Benchmark / Workload | Speed | Allocations / Notes |
+| :--- | :--- | :--- |
+| `BenchmarkDetectorIngest` | **754.4 ns/op** (~1.32M events/s) | `80 B/op`, `3 allocs/op` |
+| `BenchmarkAnalyzeUFW` (1,000 lines) | **2.66 ms/op** (~376k lines/s) | End-to-end parse + window tracking |
+| `BenchmarkAnalyzeJSONL` (1,000 lines) | **3.45 ms/op** (~290k lines/s) | End-to-end JSON decode + window tracking |
+| CLI `analyze` (100,000 JSONL lines, 14.6 MB) | **404 ms** (**~247k events/s**) | Full CLI startup, detection, and JSON serialization |
+
 ## Development & Testing
 
 ```bash
 go vet ./...
 go test -race -cover ./...
+go test -bench=. -benchmem ./internal/detector/...
 ```
 
 > Note: On Windows hosts without `gcc`/CGO enabled, run `go test -count=1 -cover ./...`; `-race` is enforced in Linux CI on every push and pull request.

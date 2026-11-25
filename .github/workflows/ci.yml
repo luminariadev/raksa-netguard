@@ -43,6 +43,13 @@ jobs:
           echo "$out"
           echo "$out" | grep -q "NET-104"
 
+      - name: Verify Windows Firewall fixture and rule catalog
+        run: |
+          fw=$(go run ./cmd/raksa-netguard analyze --log testdata/windows_pfirewall.log --log-format windows-fw --format table)
+          echo "$fw"
+          echo "$fw" | grep -q "NET-101"
+          go run ./cmd/raksa-netguard rules --format json | grep -q "NET-104"
+
       - name: Cross-compile release binaries
         run: |
           mkdir -p dist

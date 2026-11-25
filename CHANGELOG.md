@@ -2,6 +2,15 @@
 
 All notable changes to `raksa-netguard` are documented in this file.
 
+## [0.3.0] - 2026-11-25
+
+### Added
+- **O(1) Amortized Sliding-Window Engine**: Replaced per-event window scans with incremental reference-counted per-source and per-target maps, timestamp-sorted ring buffers, and zero-allocation `net/netip` canonicalization (`BenchmarkDetectorIngest` at `754.4 ns/op`, ~247k events/sec end-to-end JSONL CLI throughput).
+- **Enterprise Firewall Parsers**: Added `nftables` (`NFT-DROP` / `NFT_DROP` / `NFT-ALLOW`) and Microsoft Windows Defender Firewall W3C (`windows-fw` / `pfirewall`) parsers with auto-detection, backed by `testdata/windows_pfirewall.log`.
+- **Onboarding & Discovery CLI (`init`, `rules`)**: Added `raksa-netguard init` to generate starter YAML baseline policies from live host listeners and `raksa-netguard rules` to inspect all 10 built-in rules and MITRE D3FEND mappings.
+- **Native Stdio MCP Server (`mcp`)**: Added a dependency-free JSON-RPC 2.0 MCP server (`raksa-netguard mcp`) exposing `netguard_list_rules`, `netguard_check_policy`, `netguard_audit_host`, `netguard_generate_baseline`, and `netguard_analyze_logs` for coding and security agents.
+- **Detector Benchmarks**: Added `BenchmarkDetectorIngest`, `BenchmarkAnalyzeJSONL`, and `BenchmarkAnalyzeUFW` in `internal/detector/detector_bench_test.go`.
+
 ## [0.2.0] - 2026-11-25
 
 ### Added

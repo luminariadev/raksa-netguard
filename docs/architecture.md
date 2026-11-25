@@ -41,17 +41,19 @@
 
 ## Package Responsibilities
 
-- `cmd/raksa-netguard`: Subcommand entrypoint (`audit`, `policy-check`, `analyze`, `watch`, `version`), `--fail-on` CI gate exit codes, and `SIGINT`/`SIGTERM` lifecycle management.
-- `internal/schema`: Canonical Raksa Finding Schema v1 data structures, severity ranking, and summary aggregation.
+- `cmd/raksa-netguard`: Subcommand entrypoint (`init`, `audit`, `policy-check`, `analyze`, `watch`, `rules`, `mcp`, `version`), `--fail-on` CI gate exit codes, and `SIGINT`/`SIGTERM` lifecycle management.
+- `internal/schema`: Canonical Raksa Finding Schema v1 data structures, severity ranking, summary aggregation, and the built-in `RuleCatalog()`.
 - `internal/baseline`:
   - `policy.go`: Parses and validates YAML baseline definitions (`NET-010`, `NET-011`) and optional detector thresholds.
   - `collector.go`: Cross-platform local listening socket collector. Uses direct `/proc/net/{tcp,tcp6,udp,udp6}` hex parsing on Linux and `netstat -ano` parsing on Windows.
   - `process.go`: Best-effort process-name enrichment using `/proc/<pid>/fd` + `/proc/<pid>/comm` on Linux and `tasklist /FO CSV /NH` on Windows.
+  - `generator.go`: Builds starter baseline YAML snapshots (`init`) from active local sockets with security review notes.
   - `auditor.go`: Evaluates active host listeners against policy rules (`NET-001` through `NET-004`) with bind-address, sensitive-port, and process metadata checks.
 - `internal/detector`:
-  - `logparser.go`: Normalizes UFW, iptables, and JSONL flow events into typed network records.
-  - `detector.go`: Thread-safe per-source and per-target bounded sliding-window tracker detecting vertical port scans (`NET-101`), horizontal host sweeps (`NET-102`), connection bursts (`NET-103`), and distributed multi-source scans (`NET-104`) with cooldown suppression.
+  - `logparser.go`: Normalizes UFW, iptables, nftables, Windows Defender Firewall W3C (`pfirewall.log`), and JSONL flow events into typed network records.
+  - `detector.go`: Thread-safe O(1) amortized per-source and per-target bounded sliding-window tracker detecting vertical port scans (`NET-101`), horizontal host sweeps (`NET-102`), connection bursts (`NET-103`), and distributed multi-source scans (`NET-104`) with cooldown suppression.
   - `watcher.go`: File tailing loop supporting copytruncate truncation and inode replacement rotation detection.
+- `internal/mcp`: Dependency-free stdio JSON-RPC 2.0 MCP server exposing `netguard_*` defensive tools for autonomous agents.
 - `internal/report`: Serializes `schema.Report` into terminal tables, Raksa JSON v1, or SARIF 2.1.0 for GitHub Code Scanning.
 - `internal/notifier`: Deduplicated HTTP webhook dispatcher supporting generic JSON, Slack, and Discord payloads with retry on `5xx`.
 
