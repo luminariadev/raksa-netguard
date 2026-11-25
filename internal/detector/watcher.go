@@ -34,6 +34,7 @@ func WatchFile(ctx context.Context, path string, format string, det *Detector, p
 
 	var offset int64
 	var pending []byte
+	var lastInfo os.FileInfo
 
 	readAvailable := func() error {
 		info, err := os.Stat(path)
@@ -42,16 +43,18 @@ func WatchFile(ctx context.Context, path string, format string, det *Detector, p
 				// Log file might be momentarily absent during logrotate.
 				offset = 0
 				pending = nil
+				lastInfo = nil
 				return nil
 			}
 			return fmt.Errorf("stat watched log %q: %w", path, err)
 		}
 
 		// Reset offset if the log file was truncated or replaced by log rotation.
-		if info.Size() < offset {
+		if (lastInfo != nil && !os.SameFile(lastInfo, info)) || info.Size() < offset {
 			offset = 0
 			pending = nil
 		}
+		lastInfo = info
 		if info.Size() == offset {
 			return nil
 		}
