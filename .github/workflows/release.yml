@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to build and publish (e.g. v0.3.0)'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -12,9 +18,22 @@ jobs:
   release:
     name: Build and Publish Release
     runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
+      - name: Validate release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Set up Go
         uses: actions/setup-go@v7
@@ -31,7 +50,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${RELEASE_TAG#v}"
           COMMIT="$(git rev-parse --short HEAD)"
           BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           LDFLAGS="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildDate=${BUILD_DATE}"
@@ -65,10 +84,46 @@ jobs:
 
           (cd dist && sha256sum *.tar.gz *.zip > ../SHA256SUMS.txt && mv ../SHA256SUMS.txt .)
 
+      - name: Extract changelog release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          awk -v ver="$VERSION" '
+            $0 ~ "^## \\[" ver "\\]" { in_sec=1; next }
+            in_sec && /^## \[/ { exit }
+            in_sec { print }
+          ' CHANGELOG.md > release_notes.md
+
+          if [ ! -s release_notes.md ]; then
+            printf 'Release %s\n\nSee CHANGELOG.md for details.\n' "$RELEASE_TAG" > release_notes.md
+          fi
+
       - name: Publish GitHub Release
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "$GITHUB_REF_NAME" \
-            --generate-notes
+          set -euo pipefail
+
+          retry() {
+            local attempt=1
+            local delays=(5 15)
+            until "$@"; do
+              if [ "$attempt" -ge 3 ]; then
+                return 1
+              fi
+              local delay="${delays[$((attempt - 1))]}"
+              echo "Attempt $attempt failed; retrying in ${delay}s..." >&2
+              sleep "$delay"
+              attempt=$((attempt + 1))
+            done
+          }
+
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            retry gh release create "$RELEASE_TAG" \
+              --title "$RELEASE_TAG" \
+              --notes-file release_notes.md
+          fi
+
+          retry gh release upload "$RELEASE_TAG" dist/* --clobber
