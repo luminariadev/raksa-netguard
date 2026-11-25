@@ -23,10 +23,8 @@ func WatchFile(ctx context.Context, path string, format string, det *Detector, p
 	if normFmt == "" {
 		normFmt = "auto"
 	}
-	switch normFmt {
-	case "auto", "ufw", "iptables", "jsonl":
-	default:
-		return fmt.Errorf("unsupported log format %q: expected auto, ufw, iptables, or jsonl", format)
+	if !IsSupportedLogFormat(normFmt) {
+		return fmt.Errorf("unsupported log format %q: expected auto, ufw, iptables, nftables, windows-fw, or jsonl", format)
 	}
 	if pollInterval <= 0 {
 		pollInterval = 500 * time.Millisecond

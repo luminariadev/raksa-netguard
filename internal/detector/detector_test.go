@@ -535,3 +535,43 @@ func TestDetector_DistributedScanNET104(t *testing.T) {
 		}
 	})
 }
+
+func TestParsers_NftablesAndWindowsFirewall(t *testing.T) {
+	t.Run("parses nftables prefix drop and accept lines", func(t *testing.T) {
+		dropLine := "2026-11-25T15:00:01Z fw01 kernel: [900.1] NFT-DROP IN=eth0 SRC=198.51.100.88 DST=192.0.2.10 PROTO=TCP SPT=51000 DPT=22"
+		ev, ok, err := ParseLine(dropLine, "nftables")
+		if err != nil || !ok {
+			t.Fatalf("expected nftables drop line parsed, got ok=%v err=%v", ok, err)
+		}
+		if ev.Action != "BLOCK" || ev.SrcIP != "198.51.100.88" || ev.DstPort != 22 {
+			t.Fatalf("unexpected nftables event: %+v", ev)
+		}
+
+		allowLine := "2026-11-25T15:00:02Z fw01 kernel: [901.2] NFT_ALLOW IN=eth0 SRC=198.51.100.89 DST=192.0.2.10 PROTO=UDP SPT=51001 DPT=53"
+		ev2, ok2, err2 := ParseLine(allowLine, "auto")
+		if err2 != nil || !ok2 || ev2.Action != "ALLOW" || ev2.Protocol != "UDP" {
+			t.Fatalf("unexpected nftables allow event: ok=%v err=%v ev=%+v", ok2, err2, ev2)
+		}
+	})
+
+	t.Run("detects vertical scan in Windows Defender Firewall pfirewall.log", func(t *testing.T) {
+		for _, fmtMode := range []string{"auto", "windows-fw", "pfirewall"} {
+			f, err := os.Open(filepath.Join("..", "..", "testdata", "windows_pfirewall.log"))
+			if err != nil {
+				t.Fatalf("open pfirewall fixture: %v", err)
+			}
+			det := New(DefaultConfig())
+			findings, stats, err := det.AnalyzeReader(f, fmtMode)
+			_ = f.Close()
+			if err != nil {
+				t.Fatalf("AnalyzeReader(%s): %v", fmtMode, err)
+			}
+			if stats.EventsParsed != 14 || stats.ParseErrors != 0 {
+				t.Fatalf("format %s unexpected stats: %+v", fmtMode, stats)
+			}
+			if len(findings) != 1 || findings[0].RuleID != "NET-101" {
+				t.Fatalf("format %s expected 1 NET-101 finding, got %+v", fmtMode, findings)
+			}
+		}
+	})
+}

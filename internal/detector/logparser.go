@@ -3,7 +3,7 @@ package detector
 import (
 	"encoding/json"
 	"fmt"
-	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
@@ -52,13 +52,18 @@ func ParseLine(line string, format string) (Event, bool, error) {
 		if strings.Contains(trimmed, "SRC=") && strings.Contains(trimmed, "DST=") {
 			return parseKernelFirewallLine(trimmed)
 		}
+		if looksLikeWindowsFirewallLine(trimmed) {
+			return parseWindowsFirewallLine(trimmed)
+		}
 		return Event{}, false, nil
-	case "ufw", "iptables":
+	case "ufw", "iptables", "nftables":
 		return parseKernelFirewallLine(trimmed)
+	case "windows-fw", "pfirewall":
+		return parseWindowsFirewallLine(trimmed)
 	case "jsonl":
 		return parseJSONLLine(trimmed)
 	default:
-		return Event{}, false, fmt.Errorf("unsupported log format %q: expected auto, ufw, iptables, or jsonl", format)
+		return Event{}, false, fmt.Errorf("unsupported log format %q: expected auto, ufw, iptables, nftables, windows-fw, or jsonl", format)
 	}
 }
 
@@ -68,10 +73,13 @@ func parseJSONLLine(line string) (Event, bool, error) {
 		return Event{}, false, fmt.Errorf("parse jsonl event: %w", err)
 	}
 
-	srcIP := net.ParseIP(strings.TrimSpace(raw.SrcIP))
-	dstIP := net.ParseIP(strings.TrimSpace(raw.DstIP))
-	if srcIP == nil || dstIP == nil {
-		return Event{}, false, fmt.Errorf("jsonl event missing valid src_ip or dst_ip")
+	srcAddr, err := netip.ParseAddr(strings.TrimSpace(raw.SrcIP))
+	if err != nil {
+		return Event{}, false, fmt.Errorf("jsonl event missing valid src_ip")
+	}
+	dstAddr, err := netip.ParseAddr(strings.TrimSpace(raw.DstIP))
+	if err != nil {
+		return Event{}, false, fmt.Errorf("jsonl event missing valid dst_ip")
 	}
 
 	ts := time.Now().UTC()
@@ -94,8 +102,8 @@ func parseJSONLLine(line string) (Event, bool, error) {
 
 	return Event{
 		Timestamp: ts,
-		SrcIP:     srcIP.String(),
-		DstIP:     dstIP.String(),
+		SrcIP:     srcAddr.Unmap().String(),
+		DstIP:     dstAddr.Unmap().String(),
 		SrcPort:   raw.SrcPort,
 		DstPort:   raw.DstPort,
 		Protocol:  proto,
@@ -121,10 +129,13 @@ func parseKernelFirewallLine(line string) (Event, bool, error) {
 		kv[key] = val
 	}
 
-	srcIP := net.ParseIP(kv["SRC"])
-	dstIP := net.ParseIP(kv["DST"])
-	if srcIP == nil || dstIP == nil {
-		return Event{}, false, fmt.Errorf("kernel firewall line missing valid SRC/DST IP")
+	srcAddr, err := netip.ParseAddr(kv["SRC"])
+	if err != nil {
+		return Event{}, false, fmt.Errorf("kernel firewall line missing valid SRC IP")
+	}
+	dstAddr, err := netip.ParseAddr(kv["DST"])
+	if err != nil {
+		return Event{}, false, fmt.Errorf("kernel firewall line missing valid DST IP")
 	}
 
 	srcPort := parseOptionalPort(kv["SPT"])
@@ -140,10 +151,65 @@ func parseKernelFirewallLine(line string) (Event, bool, error) {
 
 	return Event{
 		Timestamp: ts,
-		SrcIP:     srcIP.String(),
-		DstIP:     dstIP.String(),
+		SrcIP:     srcAddr.Unmap().String(),
+		DstIP:     dstAddr.Unmap().String(),
 		SrcPort:   srcPort,
 		DstPort:   dstPort,
+		Protocol:  proto,
+		Action:    action,
+		Raw:       line,
+	}, true, nil
+}
+
+func looksLikeWindowsFirewallLine(line string) bool {
+	if len(line) < 20 || line[4] != '-' || line[7] != '-' || line[10] != ' ' {
+		return false
+	}
+	fields := strings.Fields(line)
+	if len(fields) < 8 {
+		return false
+	}
+	act := strings.ToUpper(fields[2])
+	return act == "DROP" || act == "ALLOW" || act == "INFO" || act == "OPEN" || act == "CLOSE"
+}
+
+func parseWindowsFirewallLine(line string) (Event, bool, error) {
+	// W3C Windows Defender Firewall format:
+	// date time action protocol src-ip dst-ip src-port dst-port ...
+	fields := strings.Fields(line)
+	if len(fields) < 8 {
+		return Event{}, false, fmt.Errorf("windows-fw line has fewer than 8 fields")
+	}
+
+	ts, err := time.Parse("2006-01-02 15:04:05", fields[0]+" "+fields[1])
+	if err != nil {
+		return Event{}, false, fmt.Errorf("windows-fw invalid timestamp: %w", err)
+	}
+
+	srcAddr, err := netip.ParseAddr(fields[4])
+	if err != nil {
+		return Event{}, false, fmt.Errorf("windows-fw invalid src-ip %q", fields[4])
+	}
+	dstAddr, err := netip.ParseAddr(fields[5])
+	if err != nil {
+		return Event{}, false, fmt.Errorf("windows-fw invalid dst-ip %q", fields[5])
+	}
+
+	action := strings.ToUpper(fields[2])
+	if action == "DROP" {
+		action = "BLOCK"
+	}
+	proto := strings.ToUpper(fields[3])
+	if proto == "" || proto == "-" {
+		proto = "UNKNOWN"
+	}
+
+	return Event{
+		Timestamp: ts.UTC(),
+		SrcIP:     srcAddr.Unmap().String(),
+		DstIP:     dstAddr.Unmap().String(),
+		SrcPort:   parseOptionalPort(fields[6]),
+		DstPort:   parseOptionalPort(fields[7]),
 		Protocol:  proto,
 		Action:    action,
 		Raw:       line,
@@ -186,11 +252,11 @@ func parseFlexibleTimestamp(raw string) (time.Time, error) {
 func extractFirewallAction(line string) string {
 	upper := strings.ToUpper(line)
 	switch {
-	case strings.Contains(upper, "[UFW BLOCK]") || strings.Contains(upper, " ACTION=DROP") || strings.Contains(upper, " DROP "):
+	case strings.Contains(upper, "[UFW BLOCK]") || strings.Contains(upper, "NFT-DROP") || strings.Contains(upper, "NFT_DROP") || strings.Contains(upper, " ACTION=DROP") || strings.Contains(upper, " DROP "):
 		return "BLOCK"
-	case strings.Contains(upper, "[UFW REJECT]") || strings.Contains(upper, " REJECT "):
+	case strings.Contains(upper, "[UFW REJECT]") || strings.Contains(upper, "NFT-REJECT") || strings.Contains(upper, "NFT_REJECT") || strings.Contains(upper, " REJECT "):
 		return "REJECT"
-	case strings.Contains(upper, "[UFW ALLOW]") || strings.Contains(upper, " ACCEPT "):
+	case strings.Contains(upper, "[UFW ALLOW]") || strings.Contains(upper, "NFT-ALLOW") || strings.Contains(upper, "NFT_ALLOW") || strings.Contains(upper, "NFT-ACCEPT") || strings.Contains(upper, "NFT_ACCEPT") || strings.Contains(upper, " ACCEPT "):
 		return "ALLOW"
 	case strings.Contains(upper, "[UFW AUDIT]"):
 		return "AUDIT"
@@ -200,7 +266,7 @@ func extractFirewallAction(line string) string {
 }
 
 func parseOptionalPort(s string) int {
-	if s == "" {
+	if s == "" || s == "-" {
 		return 0
 	}
 	p, err := strconv.Atoi(s)
